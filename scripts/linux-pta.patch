@@ -1,0 +1,81 @@
+diff --git a/arch/arm64/include/asm/pointer_auth.h b/arch/arm64/include/asm/pointer_auth.h
+index fe57babda..0d87bca75 100644
+--- a/arch/arm64/include/asm/pointer_auth.h
++++ b/arch/arm64/include/asm/pointer_auth.h
+@@ -49,6 +49,11 @@ extern uint64_t mte_ftag_count;
+ extern uint64_t normal_alloc_count;
+ extern uint64_t mte_alloc_count;
+ 
++extern int __attribute__((annotate("eperm"))) eperm;
++extern int __attribute__((annotate("eacces"))) eacces;
++extern int __attribute__((annotate("erofs"))) erofs;
++
++
+ /*
+  * Each key is a 128-bit quantity which is split across a pair of 64-bit
+  * registers (Lo and Hi).
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index c3c528262..6424277cf 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1871,7 +1871,7 @@ static inline void ext4_simulate_fail_bh(struct super_block *sb,
+ #define EXT4_ERR_EFSCORRUPTED	 5
+ #define EXT4_ERR_ENOSPC		 6
+ #define EXT4_ERR_ENOKEY		 7
+-#define EXT4_ERR_EROFS		 8
++#define EXT4_ERR__EROFS		 8
+ #define EXT4_ERR_EFBIG		 9
+ #define EXT4_ERR_EEXIST		10
+ #define EXT4_ERR_ERANGE		11
+diff --git a/include/uapi/asm-generic/errno-base.h b/include/uapi/asm-generic/errno-base.h
+index 9653140bf..3dda4ae99 100644
+--- a/include/uapi/asm-generic/errno-base.h
++++ b/include/uapi/asm-generic/errno-base.h
+@@ -2,7 +2,8 @@
+ #ifndef _ASM_GENERIC_ERRNO_BASE_H
+ #define _ASM_GENERIC_ERRNO_BASE_H
+ 
+-#define	EPERM		 1	/* Operation not permitted */
++#define	_EPERM		 1	/* Operation not permitted */
++#define EPERM eperm
+ #define	ENOENT		 2	/* No such file or directory */
+ #define	ESRCH		 3	/* No such process */
+ #define	EINTR		 4	/* Interrupted system call */
+@@ -14,7 +15,8 @@
+ #define	ECHILD		10	/* No child processes */
+ #define	EAGAIN		11	/* Try again */
+ #define	ENOMEM		12	/* Out of memory */
+-#define	EACCES		13	/* Permission denied */
++#define	_EACCES		13	/* Permission denied */
++#define EACCES eacces
+ #define	EFAULT		14	/* Bad address */
+ #define	ENOTBLK		15	/* Block device required */
+ #define	EBUSY		16	/* Device or resource busy */
+@@ -31,7 +33,8 @@
+ #define	EFBIG		27	/* File too large */
+ #define	ENOSPC		28	/* No space left on device */
+ #define	ESPIPE		29	/* Illegal seek */
+-#define	EROFS		30	/* Read-only file system */
++#define	_EROFS		30	/* Read-only file system */
++#define EROFS erofs
+ #define	EMLINK		31	/* Too many links */
+ #define	EPIPE		32	/* Broken pipe */
+ #define	EDOM		33	/* Math argument out of domain of func */
+diff --git a/kernel/kdfi.c b/kernel/kdfi.c
+index 47e11a30b..9e68be59c 100644
+--- a/kernel/kdfi.c
++++ b/kernel/kdfi.c
+@@ -3,6 +3,13 @@
+ #include <linux/syscalls.h>
+ #include <asm/sysreg.h>
+ 
++int eperm = 1;
++EXPORT_SYMBOL(eperm);
++int eacces = 13;
++EXPORT_SYMBOL(eacces);
++int erofs = 30;
++EXPORT_SYMBOL(erofs);
++
+ void petal_print(void) {
+     pr_err("PETAL TEST\n");
+ }

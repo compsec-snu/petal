@@ -1,0 +1,5797 @@
+diff --git a/clang/include/clang/Basic/Features.def b/clang/include/clang/Basic/Features.def
+index 6ca0e646b..60fc3f49e 100644
+--- a/clang/include/clang/Basic/Features.def
++++ b/clang/include/clang/Basic/Features.def
+@@ -37,6 +37,7 @@
+ #endif
+ 
+ FEATURE(speculative_load_hardening, LangOpts.SpeculativeLoadHardening)
++FEATURE(kdfi_instrument, LangOpts.Sanitize.has(SanitizerKind::KDFIInstrument))
+ FEATURE(address_sanitizer,
+         LangOpts.Sanitize.hasOneOf(SanitizerKind::Address |
+                                    SanitizerKind::KernelAddress))
+diff --git a/clang/include/clang/Basic/Sanitizers.def b/clang/include/clang/Basic/Sanitizers.def
+index 9b8936cc5..ed7ec2003 100644
+--- a/clang/include/clang/Basic/Sanitizers.def
++++ b/clang/include/clang/Basic/Sanitizers.def
+@@ -185,5 +185,9 @@ SANITIZER("scudo", Scudo)
+ // can be used to disable all the sanitizers.
+ SANITIZER_GROUP("all", All, ~SanitizerMask())
+ 
++
++// KDFIInstrument
++SANITIZER("kdfi_instrument", KDFIInstrument)
++
+ #undef SANITIZER
+ #undef SANITIZER_GROUP
+diff --git a/clang/include/clang/Driver/SanitizerArgs.h b/clang/include/clang/Driver/SanitizerArgs.h
+index d288b0151..2ee9e2189 100644
+--- a/clang/include/clang/Driver/SanitizerArgs.h
++++ b/clang/include/clang/Driver/SanitizerArgs.h
+@@ -90,6 +90,7 @@ public:
+   bool needsFuzzerInterceptors() const;
+   bool needsUbsanRt() const;
+   bool requiresMinimalRuntime() const { return MinimalRuntime; }
++  bool needsKDFIInstrumentRt() const { return Sanitizers.has(SanitizerKind::KDFIInstrument); }
+   bool needsDfsanRt() const { return Sanitizers.has(SanitizerKind::DataFlow); }
+   bool needsSafeStackRt() const { return SafeStackRuntime; }
+   bool needsCfiRt() const;
+diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
+index a4d330c0b..c1743a15b 100644
+--- a/clang/lib/CodeGen/BackendUtil.cpp
++++ b/clang/lib/CodeGen/BackendUtil.cpp
+@@ -87,6 +87,7 @@
+ #include "llvm/Transforms/Utils/ModuleUtils.h"
+ #include "llvm/Transforms/Utils/NameAnonGlobals.h"
+ #include "llvm/Transforms/Utils/SymbolRewriter.h"
++#include "llvm/Transforms/Instrumentation/KDFIInstrumentPass.h"
+ #include <memory>
+ using namespace clang;
+ using namespace llvm;
+@@ -1227,6 +1228,10 @@ static void addSanitizers(const Triple &TargetTriple,
+     if (LangOpts.Sanitize.has(SanitizerKind::DataFlow)) {
+       MPM.addPass(DataFlowSanitizerPass(LangOpts.NoSanitizeFiles));
+     }
++
++    if (LangOpts.Sanitize.has(SanitizerKind::KDFIInstrument)) {
++      MPM.addPass(KDFIInstrumentPass());
++    }
+   });
+ }
+ 
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.cpp b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+index dfcef2304..91965d013 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.cpp
++++ b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+@@ -882,6 +882,8 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
+         StaticRuntimes.push_back("hwasan_cxx");
+     }
+   }
++  if (SanArgs.needsKDFIInstrumentRt() && SanArgs.linkRuntimes())
++    StaticRuntimes.push_back("kdfi_instrument");
+   if (SanArgs.needsDfsanRt() && SanArgs.linkRuntimes())
+     StaticRuntimes.push_back("dfsan");
+   if (SanArgs.needsLsanRt() && SanArgs.linkRuntimes())
+diff --git a/clang/lib/Driver/ToolChains/Linux.cpp b/clang/lib/Driver/ToolChains/Linux.cpp
+index f85c04df4..268f630a6 100644
+--- a/clang/lib/Driver/ToolChains/Linux.cpp
++++ b/clang/lib/Driver/ToolChains/Linux.cpp
+@@ -718,6 +718,7 @@ SanitizerMask Linux::getSupportedSanitizers() const {
+   Res |= SanitizerKind::Memory;
+   Res |= SanitizerKind::Vptr;
+   Res |= SanitizerKind::SafeStack;
++  Res |= SanitizerKind::KDFIInstrument;
+   if (IsX86_64 || IsMIPS64 || IsAArch64)
+     Res |= SanitizerKind::DataFlow;
+   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsX86 || IsArmArch || IsPowerPC64 ||
+diff --git a/llvm/include/llvm/InitializePasses.h b/llvm/include/llvm/InitializePasses.h
+index 489ef0457..9bdaf727d 100644
+--- a/llvm/include/llvm/InitializePasses.h
++++ b/llvm/include/llvm/InitializePasses.h
+@@ -463,7 +463,7 @@ void initializeWinEHPreparePass(PassRegistry&);
+ void initializeWriteBitcodePassPass(PassRegistry&);
+ void initializeWriteThinLTOBitcodePass(PassRegistry&);
+ void initializeXRayInstrumentationPass(PassRegistry&);
+-
++void initializeKDFIInstrumentLegacyPassPass(PassRegistry &);
+ } // end namespace llvm
+ 
+ #endif // LLVM_INITIALIZEPASSES_H
+diff --git a/llvm/include/llvm/Transforms/Instrumentation.h b/llvm/include/llvm/Transforms/Instrumentation.h
+index a288a3972..541253325 100644
+--- a/llvm/include/llvm/Transforms/Instrumentation.h
++++ b/llvm/include/llvm/Transforms/Instrumentation.h
+@@ -148,6 +148,9 @@ ModulePass *createInstrOrderFilePass();
+ ModulePass *createDataFlowSanitizerLegacyPassPass(
+     const std::vector<std::string> &ABIListFiles = std::vector<std::string>());
+ 
++ModulePass *createKDFIInstrumentationLegacyPassPass();
++
++
+ // Options for sanitizer coverage instrumentation.
+ struct SanitizerCoverageOptions {
+   enum Type {
+diff --git a/llvm/include/llvm/Transforms/Instrumentation/KDFIInstrumentPass.h b/llvm/include/llvm/Transforms/Instrumentation/KDFIInstrumentPass.h
+new file mode 100644
+index 000000000..bd2ffbdbf
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Instrumentation/KDFIInstrumentPass.h
+@@ -0,0 +1,16 @@
++#ifndef __KDFIINSTRUMENTPASS_H_
++#define __KDFIINSTRUMENTPASS_H_
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/PassManager.h"
++namespace llvm {
++    class KDFIInstrumentPass : public PassInfoMixin<KDFIInstrumentPass> {
++    public:
++        KDFIInstrumentPass() {};
++        PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) ;
++    };
++    ModulePass *createKDFIInstrumentLegacyPassPass();
++} // namespace llvm
++
++
++#endif // __KDFIINSTRUMENTPASS_H_
+diff --git a/llvm/lib/CodeGen/SelectionDAG/FunctionLoweringInfo.cpp b/llvm/lib/CodeGen/SelectionDAG/FunctionLoweringInfo.cpp
+index 85c6eca57..c4a14f10c 100644
+--- a/llvm/lib/CodeGen/SelectionDAG/FunctionLoweringInfo.cpp
++++ b/llvm/lib/CodeGen/SelectionDAG/FunctionLoweringInfo.cpp
+@@ -161,6 +161,12 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
+ 
+           TySize *= CUI->getZExtValue();   // Get total allocated size.
+           if (TySize == 0) TySize = 1; // Don't create zero-sized stack objects.
++
++          // PeTAL: Round priv alloca size to 16 bytes
++          if (AI->hasMetadata("stack_tagging")) {
++            TySize = (TySize + 15) / 16 * 16;
++          }
++
+           int FrameIndex = INT_MAX;
+           auto Iter = CatchObjects.find(AI);
+           if (Iter != CatchObjects.end() && TLI->needsFixedCatchObjects()) {
+diff --git a/llvm/lib/Linker/IRMover.cpp b/llvm/lib/Linker/IRMover.cpp
+index b475ea81d..67a57ab1b 100644
+--- a/llvm/lib/Linker/IRMover.cpp
++++ b/llvm/lib/Linker/IRMover.cpp
+@@ -119,6 +119,21 @@ bool TypeMapTy::areTypesIsomorphic(Type *DstTy, Type *SrcTy) {
+   if (DstTy->getTypeID() != SrcTy->getTypeID())
+     return false;
+ 
++  // PeTAL: struct types with different name are not isomorphic
++  if (StructType *DSty = dyn_cast<StructType>(DstTy)) {
++    StructType *SSty = cast<StructType>(SrcTy);
++    std::string Dname = DSty->getName().str();
++    std::string Sname = SSty->getName().str();
++    if (Dname.find_first_of(".") != Dname.find_last_of("."))
++      Dname = Dname.substr(0, Dname.find_last_of("."));
++    if (Sname.find_first_of(".") != Sname.find_last_of("."))
++      Sname = Sname.substr(0, Sname.find_last_of("."));
++
++    if (Dname != Sname) {
++      return false;
++    }
++  }
++
+   // If we have an entry in the MappedTypes table, then we have our answer.
+   Type *&Entry = MappedTypes[SrcTy];
+   if (Entry)
+@@ -1606,7 +1621,10 @@ unsigned IRMover::StructTypeKeyInfo::getHashValue(const KeyTy &Key) {
+ }
+ 
+ unsigned IRMover::StructTypeKeyInfo::getHashValue(const StructType *ST) {
+-  return getHashValue(KeyTy(ST));
++  auto Sname = ST->getName();
++  if (Sname.find_first_of(".") != Sname.find_last_of("."))
++      Sname = Sname.substr(0, Sname.find_last_of("."));
++  return hash_combine(getHashValue(KeyTy(ST)), Sname);
+ }
+ 
+ bool IRMover::StructTypeKeyInfo::isEqual(const KeyTy &LHS,
+diff --git a/llvm/lib/Linker/LinkModules.cpp b/llvm/lib/Linker/LinkModules.cpp
+index f9f51bf17..f27f24b2b 100644
+--- a/llvm/lib/Linker/LinkModules.cpp
++++ b/llvm/lib/Linker/LinkModules.cpp
+@@ -318,6 +318,10 @@ bool ModuleLinker::shouldLinkFromSource(bool &LinkFromSrc,
+     return false;
+   }
+ 
++  // PeTAL: don't emit error
++  LinkFromSrc = false;
++  return false;
++
+   assert(!Src.hasExternalWeakLinkage());
+   assert(!Dest.hasExternalWeakLinkage());
+   assert(Dest.hasExternalLinkage() && Src.hasExternalLinkage() &&
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index dedfc81f1..ddde1b8db 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -129,6 +129,7 @@
+ #include "llvm/Transforms/Instrumentation/CGProfile.h"
+ #include "llvm/Transforms/Instrumentation/ControlHeightReduction.h"
+ #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
++#include "llvm/Transforms/Instrumentation/KDFIInstrumentPass.h"
+ #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
+ #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
+ #include "llvm/Transforms/Instrumentation/InstrOrderFile.h"
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 69d8d8c43..84368e842 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -112,6 +112,7 @@ MODULE_PASS("synthetic-counts-propagation", SyntheticCountsPropagation())
+ MODULE_PASS("verify", VerifierPass())
+ MODULE_PASS("wholeprogramdevirt", WholeProgramDevirtPass())
+ MODULE_PASS("dfsan", DataFlowSanitizerPass())
++MODULE_PASS("kdfi_instrument", KDFIInstrumentPass())
+ MODULE_PASS("msan-module", ModuleMemorySanitizerPass({}))
+ MODULE_PASS("module-inline", ModuleInlinerPass())
+ MODULE_PASS("tsan-module", ModuleThreadSanitizerPass())
+diff --git a/llvm/lib/Target/AArch64/AArch64FrameLowering.cpp b/llvm/lib/Target/AArch64/AArch64FrameLowering.cpp
+index a4d20735e..af0be0efb 100644
+--- a/llvm/lib/Target/AArch64/AArch64FrameLowering.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FrameLowering.cpp
+@@ -886,8 +886,10 @@ static MachineBasicBlock::iterator convertCalleeSaveRestoreToSPPrePostIncDec(
+   // instructions and associated CFI instruction.
+   while (MBBI->getOpcode() == AArch64::STRXpost ||
+          MBBI->getOpcode() == AArch64::LDRXpre ||
+-         MBBI->getOpcode() == AArch64::CFI_INSTRUCTION) {
+-    if (MBBI->getOpcode() != AArch64::CFI_INSTRUCTION)
++         MBBI->getOpcode() == AArch64::CFI_INSTRUCTION ||
++         MBBI->getOpcode() == AArch64::STGOffset) {
++    if (MBBI->getOpcode() != AArch64::CFI_INSTRUCTION &&
++        MBBI->getOpcode() != AArch64::STGOffset)
+       assert(MBBI->getOperand(0).getReg() != AArch64::SP);
+     ++MBBI;
+   }
+@@ -958,6 +960,12 @@ static MachineBasicBlock::iterator convertCalleeSaveRestoreToSPPrePostIncDec(
+     return std::prev(MBBI);
+   }
+ 
++  auto MIB_STG = MBBI;
++  if (InProlog) 
++    MIB_STG++;
++  else
++    MIB_STG--;
++
+   MachineInstrBuilder MIB = BuildMI(MBB, MBBI, DL, TII->get(NewOpc));
+   MIB.addReg(AArch64::SP, RegState::Define);
+ 
+@@ -984,6 +992,12 @@ static MachineBasicBlock::iterator convertCalleeSaveRestoreToSPPrePostIncDec(
+     InsertSEH(*MIB, *TII,
+               InProlog ? MachineInstr::FrameSetup : MachineInstr::FrameDestroy);
+   }
++  if (MIB_STG->getOpcode() == AArch64::STGOffset) {
++    if (InProlog)
++      MIB_STG->getOperand(MIB_STG->getNumExplicitOperands() - 1).setImm(CSStackSizeInc / Scale / 16);
++    else 
++      MIB_STG->getOperand(MIB_STG->getNumExplicitOperands() - 1).setImm((-1)*CSStackSizeInc / Scale / 16);
++  }
+ 
+   return std::prev(MBB.erase(MBBI));
+ }
+@@ -1002,7 +1016,8 @@ static void fixupCalleeSaveRestoreStackOffset(MachineInstr &MI,
+   // Ignore instructions that do not operate on SP, i.e. shadow call stack
+   // instructions and associated CFI instruction.
+   if (Opc == AArch64::STRXpost || Opc == AArch64::LDRXpre ||
+-      Opc == AArch64::CFI_INSTRUCTION) {
++      Opc == AArch64::CFI_INSTRUCTION || 
++      Opc == AArch64::ANDXri || Opc == AArch64::ADDXri) {
+     if (Opc != AArch64::CFI_INSTRUCTION)
+       assert(MI.getOperand(0).getReg() != AArch64::SP);
+     return;
+@@ -1024,6 +1039,8 @@ static void fixupCalleeSaveRestoreStackOffset(MachineInstr &MI,
+   case AArch64::STRQui:
+   case AArch64::LDPQi:
+   case AArch64::LDRQui:
++  case AArch64::STGPi:
++  case AArch64::STGOffset:
+     Scale = 16;
+     break;
+   default:
+@@ -1037,6 +1054,7 @@ static void fixupCalleeSaveRestoreStackOffset(MachineInstr &MI,
+   MachineOperand &OffsetOpnd = MI.getOperand(OffsetIdx);
+   // All generated opcodes have scaled offsets.
+   assert(LocalStackSize % Scale == 0);
++
+   OffsetOpnd.setImm(OffsetOpnd.getImm() + LocalStackSize / Scale);
+ 
+   if (NeedsWinCFI) {
+@@ -1047,6 +1065,11 @@ static void fixupCalleeSaveRestoreStackOffset(MachineInstr &MI,
+            "Expecting a SEH instruction");
+     fixupSEHOpcode(MBBI, LocalStackSize);
+   }
++
++  if (std::getenv("MTE_DEBUG")) {
++    MI.getParent()->dump();
++  }
++
+ }
+ 
+ static void adaptForLdStOpt(MachineBasicBlock &MBB,
+@@ -2477,6 +2500,8 @@ bool AArch64FrameLowering::spillCalleeSavedRegisters(
+   SmallVector<RegPairInfo, 8> RegPairs;
+ 
+   bool NeedShadowCallStackProlog = false;
++  bool NeedStackTagging=false;
++
+   computeCalleeSaveRegisterPairs(MF, CSI, TRI, RegPairs,
+                                  NeedShadowCallStackProlog, hasFP(MF));
+   const MachineRegisterInfo &MRI = MF.getRegInfo();
+@@ -2512,6 +2537,10 @@ bool AArch64FrameLowering::spillCalleeSavedRegisters(
+     // This instruction also makes x18 live-in to the entry block.
+     MBB.addLiveIn(AArch64::X18);
+   }
++  
++  if (MF.getFunction().hasFnAttribute("stack_tagging")) {
++    NeedStackTagging=true;
++  }
+ 
+   if (homogeneousPrologEpilog(MF)) {
+     auto MIB = BuildMI(MBB, MI, DL, TII.get(AArch64::HOM_Prolog))
+@@ -2551,6 +2580,11 @@ bool AArch64FrameLowering::spillCalleeSavedRegisters(
+        StrOpc = RPI.isPaired() ? AArch64::STPXi : AArch64::STRXui;
+        Size = 8;
+        Alignment = Align(8);
++       if (NeedStackTagging && Reg1 != AArch64::LR) {
++         if (RPI.isPaired()) {
++           StrOpc = AArch64::STGPi; 
++         }
++       }
+        break;
+     case RegPairInfo::FPR64:
+        StrOpc = RPI.isPaired() ? AArch64::STPDi : AArch64::STRDui;
+@@ -2593,6 +2627,17 @@ bool AArch64FrameLowering::spillCalleeSavedRegisters(
+     MachineInstrBuilder MIB = BuildMI(MBB, MI, DL, TII.get(StrOpc));
+     if (!MRI.isReserved(Reg1))
+       MBB.addLiveIn(Reg1);
++    if (StrOpc == AArch64::STGPi) {
++      if (!MRI.isReserved(Reg2))
++        MBB.addLiveIn(Reg2);
++      MIB.addReg(Reg2, getPrologueDeath(MF, Reg2)); 
++      MIB.addReg(Reg1, getPrologueDeath(MF, Reg1))
++        .addReg(AArch64::SP)
++        .addImm(RPI.Offset/2) // [sp, #offset*scale],
++                            // where factor*scale is implicit
++        .setMIFlag(MachineInstr::FrameSetup);
++
++    } else {
+     if (RPI.isPaired()) {
+       if (!MRI.isReserved(Reg2))
+         MBB.addLiveIn(Reg2);
+@@ -2609,6 +2654,7 @@ bool AArch64FrameLowering::spillCalleeSavedRegisters(
+     MIB.addMemOperand(MF.getMachineMemOperand(
+         MachinePointerInfo::getFixedStack(MF, FrameIdxReg1),
+         MachineMemOperand::MOStore, Size, Alignment));
++    }
+     if (NeedsWinCFI)
+       InsertSEH(MIB, TII, MachineInstr::FrameSetup);
+ 
+@@ -2617,7 +2663,21 @@ bool AArch64FrameLowering::spillCalleeSavedRegisters(
+     if (RPI.Type == RegPairInfo::ZPR || RPI.Type == RegPairInfo::PPR)
+       MFI.setStackID(RPI.FrameIdx, TargetStackID::ScalableVector);
+ 
++    if (NeedStackTagging && RPI.Type == RegPairInfo::GPR &&
++        !RPI.isPaired() && Reg1 != AArch64::LR) {
++      MachineInstrBuilder MIB = BuildMI(MBB, MI, DL, TII.get(AArch64::STGOffset));
++      MIB.addReg(AArch64::SP)
++        .addReg(AArch64::SP)
++        .addImm(RPI.Offset/2)
++        .setMIFlag(MachineInstr::FrameSetup);
++    }
+   }
++
++  if (std::getenv("MTE_DEBUG") && NeedStackTagging) {
++    errs() << "Tagging Set: " << MF.getName() << "\n";
++    MBB.dump(); 
++  }
++
+   return true;
+ }
+ 
+@@ -2629,11 +2689,15 @@ bool AArch64FrameLowering::restoreCalleeSavedRegisters(
+   DebugLoc DL;
+   SmallVector<RegPairInfo, 8> RegPairs;
+   bool NeedsWinCFI = needsWinCFI(MF);
++  bool NeedStackTagging=false;
++  if (MF.getFunction().hasFnAttribute("stack_tagging"))
++    NeedStackTagging=true;
+ 
+   if (MI != MBB.end())
+     DL = MI->getDebugLoc();
+ 
+   bool NeedShadowCallStackProlog = false;
++  bool sp_zero=false;
+   computeCalleeSaveRegisterPairs(MF, CSI, TRI, RegPairs,
+                                  NeedShadowCallStackProlog, hasFP(MF));
+ 
+@@ -2641,6 +2705,35 @@ bool AArch64FrameLowering::restoreCalleeSavedRegisters(
+     unsigned Reg1 = RPI.Reg1;
+     unsigned Reg2 = RPI.Reg2;
+ 
++    if (NeedStackTagging && 
++        RPI.Type == RegPairInfo::GPR && Reg1 != AArch64::LR) {
++      if (!sp_zero) {
++        // mov x12, sp
++        MachineInstrBuilder MIB_mov = BuildMI(MBB, MI, DL, TII.get(AArch64::ADDXri))
++          .addReg(AArch64::X12, RegState::Define).addReg(AArch64::SP)
++          .addImm(0).addImm(AArch64_AM::getShifterImm(AArch64_AM::LSL, 0))
++          .setMIFlag(MachineInstr::FrameDestroy);
++
++        // and x12, x12, 0xf0ffffffffff
++        MachineInstrBuilder MIB_and = BuildMI(MBB, MI, DL, TII.get(AArch64::ANDXri), AArch64::X12)
++          .addReg(AArch64::X12, RegState::Kill)
++          .addImm(AArch64_AM::encodeLogicalImmediate(0xf0ffffffffffffff,64))
++          .setMIFlag(MachineInstr::FrameDestroy);
++        sp_zero=true;
++      }
++    }
++
++    if (NeedStackTagging && RPI.Type == RegPairInfo::GPR &&
++        Reg1 != AArch64::LR) {
++      // set tag 0 to the current stack frame
++      // stg x11, [x12, #offset]
++      MachineInstrBuilder MIB = BuildMI(MBB, MI, DL, TII.get(AArch64::STGOffset))
++        .addReg(AArch64::X12)
++        .addReg(AArch64::X12)
++        .addImm(RPI.Offset/2);
++      MIB.setMIFlag(MachineInstr::FrameDestroy);
++    }
++
+     // Issue sequence of restores for cs regs. The last restore may be converted
+     // to a post-increment load later by emitEpilogue if the callee-save stack
+     // area allocation can't be combined with the local stack area allocation.
+@@ -2745,6 +2838,11 @@ bool AArch64FrameLowering::restoreCalleeSavedRegisters(
+         .setMIFlag(MachineInstr::FrameDestroy);
+   }
+ 
++  if (std::getenv("MTE_DEBUG") && NeedStackTagging) {
++    errs() << "Tagging Destroy: " << MF.getName() << "\n";
++    MBB.dump(); 
++  }
++
+   return true;
+ }
+ 
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp
+index f11ba8772..d8624055e 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp
+@@ -255,25 +255,31 @@ InstCombinerImpl::isEliminableCastPair(const CastInst *CI1,
+   Type *SrcTy = CI1->getSrcTy();
+   Type *MidTy = CI1->getDestTy();
+   Type *DstTy = CI2->getDestTy();
+-
+-  Instruction::CastOps firstOp = CI1->getOpcode();
+-  Instruction::CastOps secondOp = CI2->getOpcode();
+-  Type *SrcIntPtrTy =
+-      SrcTy->isPtrOrPtrVectorTy() ? DL.getIntPtrType(SrcTy) : nullptr;
+-  Type *MidIntPtrTy =
+-      MidTy->isPtrOrPtrVectorTy() ? DL.getIntPtrType(MidTy) : nullptr;
+-  Type *DstIntPtrTy =
+-      DstTy->isPtrOrPtrVectorTy() ? DL.getIntPtrType(DstTy) : nullptr;
+-  unsigned Res = CastInst::isEliminableCastPair(firstOp, secondOp, SrcTy, MidTy,
++  Type *MidETy = MidTy;
++  unsigned Res = 0;
++
++  // PeTAL: we don't want to eliminate struct type casts
++  if (auto MidPTy = dyn_cast<PointerType>(MidTy)) 
++    MidETy = MidPTy->getPointerElementType();
++
++  if (!isa<StructType>(MidETy)) {
++    Instruction::CastOps firstOp = CI1->getOpcode();
++    Instruction::CastOps secondOp = CI2->getOpcode();
++    Type *SrcIntPtrTy =
++        SrcTy->isPtrOrPtrVectorTy() ? DL.getIntPtrType(SrcTy) : nullptr;
++    Type *MidIntPtrTy =
++        MidTy->isPtrOrPtrVectorTy() ? DL.getIntPtrType(MidTy) : nullptr;
++    Type *DstIntPtrTy =
++        DstTy->isPtrOrPtrVectorTy() ? DL.getIntPtrType(DstTy) : nullptr;
++    Res = CastInst::isEliminableCastPair(firstOp, secondOp, SrcTy, MidTy,
+                                                 DstTy, SrcIntPtrTy, MidIntPtrTy,
+                                                 DstIntPtrTy);
+-
+-  // We don't want to form an inttoptr or ptrtoint that converts to an integer
+-  // type that differs from the pointer size.
+-  if ((Res == Instruction::IntToPtr && SrcTy != DstIntPtrTy) ||
+-      (Res == Instruction::PtrToInt && DstTy != SrcIntPtrTy))
+-    Res = 0;
+-
++    // We don't want to form an inttoptr or ptrtoint that converts to an integer
++    // type that differs from the pointer size.
++    if ((Res == Instruction::IntToPtr && SrcTy != DstIntPtrTy) ||
++        (Res == Instruction::PtrToInt && DstTy != SrcIntPtrTy))
++      Res = 0;
++  }
+   return Instruction::CastOps(Res);
+ }
+ 
+@@ -2039,21 +2045,22 @@ Instruction *InstCombinerImpl::visitIntToPtr(IntToPtrInst &CI) {
+ Instruction *InstCombinerImpl::commonPointerCastTransforms(CastInst &CI) {
+   Value *Src = CI.getOperand(0);
+ 
+-  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Src)) {
+-    // If casting the result of a getelementptr instruction with no offset, turn
+-    // this into a cast of the original pointer!
+-    if (GEP->hasAllZeroIndices() &&
+-        // If CI is an addrspacecast and GEP changes the poiner type, merging
+-        // GEP into CI would undo canonicalizing addrspacecast with different
+-        // pointer types, causing infinite loops.
+-        (!isa<AddrSpaceCastInst>(CI) ||
+-         GEP->getType() == GEP->getPointerOperandType())) {
+-      // Changing the cast operand is usually not a good idea but it is safe
+-      // here because the pointer operand is being replaced with another
+-      // pointer operand so the opcode doesn't need to change.
+-      return replaceOperand(CI, 0, GEP->getOperand(0));
+-    }
+-  }
++  // PeTAL: skip gep replacement
++  //if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(Src)) {
++  //  // If casting the result of a getelementptr instruction with no offset, turn
++  //  // this into a cast of the original pointer!
++  //  if (GEP->hasAllZeroIndices() &&
++  //      // If CI is an addrspacecast and GEP changes the poiner type, merging
++  //      // GEP into CI would undo canonicalizing addrspacecast with different
++  //      // pointer types, causing infinite loops.
++  //      (!isa<AddrSpaceCastInst>(CI) ||
++  //       GEP->getType() == GEP->getPointerOperandType())) {
++  //    // Changing the cast operand is usually not a good idea but it is safe
++  //    // here because the pointer operand is being replaced with another
++  //    // pointer operand so the opcode doesn't need to change.
++  //    return replaceOperand(CI, 0, GEP->getOperand(0));
++  //  }
++  //}
+ 
+   return commonCastTransforms(CI);
+ }
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp
+index 756792918..a1d4d5201 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp
+@@ -942,11 +942,12 @@ Instruction *InstCombinerImpl::visitLoadInst(LoadInst &LI) {
+   if (KnownAlign > LI.getAlign())
+     LI.setAlignment(KnownAlign);
+ 
+-  // Replace GEP indices if possible.
+-  if (Instruction *NewGEPI = replaceGEPIdxWithZero(*this, Op, LI)) {
+-      Worklist.push(NewGEPI);
+-      return &LI;
+-  }
++  // PeTAL: skip gep replacement
++  //// Replace GEP indices if possible.
++  //if (Instruction *NewGEPI = replaceGEPIdxWithZero(*this, Op, LI)) {
++  //    Worklist.push(NewGEPI);
++  //    return &LI;
++  //}
+ 
+   if (Instruction *Res = unpackLoadToAggregate(*this, LI))
+     return Res;
+@@ -1349,11 +1350,12 @@ Instruction *InstCombinerImpl::visitStoreInst(StoreInst &SI) {
+   if (removeBitcastsFromLoadStoreOnMinMax(*this, SI))
+     return eraseInstFromFunction(SI);
+ 
+-  // Replace GEP indices if possible.
+-  if (Instruction *NewGEPI = replaceGEPIdxWithZero(*this, Ptr, SI)) {
+-      Worklist.push(NewGEPI);
+-      return &SI;
+-  }
++  // PeTAL: skip gep replacement
++  //// Replace GEP indices if possible.
++  //if (Instruction *NewGEPI = replaceGEPIdxWithZero(*this, Ptr, SI)) {
++  //    Worklist.push(NewGEPI);
++  //    return &SI;
++  //}
+ 
+   // Don't hack volatile/ordered stores.
+   // FIXME: Some bits are legal for ordered atomic stores; needs refactoring.
+diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp
+index 3091905ca..40f8a5ee8 100644
+--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp
+@@ -2135,56 +2135,57 @@ Instruction *InstCombinerImpl::visitGEPOfBitcast(BitCastInst *BCI,
+   // analysis of unions. If "A" is also a bitcast, wait for A/X to be merged.
+   unsigned OffsetBits = DL.getIndexTypeSizeInBits(GEP.getType());
+   APInt Offset(OffsetBits, 0);
+-
++  
++  // PeTAL: skip bitcast optimization 
+   // If the bitcast argument is an allocation, The bitcast is for convertion
+   // to actual type of allocation. Removing such bitcasts, results in having
+   // GEPs with i8* base and pure byte offsets. That means GEP is not aware of
+   // struct or array hierarchy.
+   // By avoiding such GEPs, phi translation and MemoryDependencyAnalysis have
+   // a better chance to succeed.
+-  if (!isa<BitCastInst>(SrcOp) && GEP.accumulateConstantOffset(DL, Offset) &&
+-      !isAllocationFn(SrcOp, &TLI)) {
+-    // If this GEP instruction doesn't move the pointer, just replace the GEP
+-    // with a bitcast of the real input to the dest type.
+-    if (!Offset) {
+-      // If the bitcast is of an allocation, and the allocation will be
+-      // converted to match the type of the cast, don't touch this.
+-      if (isa<AllocaInst>(SrcOp)) {
+-        // See if the bitcast simplifies, if so, don't nuke this GEP yet.
+-        if (Instruction *I = visitBitCast(*BCI)) {
+-          if (I != BCI) {
+-            I->takeName(BCI);
+-            BCI->getParent()->getInstList().insert(BCI->getIterator(), I);
+-            replaceInstUsesWith(*BCI, I);
+-          }
+-          return &GEP;
+-        }
+-      }
+-
+-      if (SrcType->getPointerAddressSpace() != GEP.getAddressSpace())
+-        return new AddrSpaceCastInst(SrcOp, GEP.getType());
+-      return new BitCastInst(SrcOp, GEP.getType());
+-    }
+-
+-    // Otherwise, if the offset is non-zero, we need to find out if there is a
+-    // field at Offset in 'A's type.  If so, we can pull the cast through the
+-    // GEP.
+-    SmallVector<Value*, 8> NewIndices;
+-    if (findElementAtOffset(SrcType, Offset.getSExtValue(), NewIndices, DL)) {
+-      Value *NGEP =
+-          GEP.isInBounds()
+-              ? Builder.CreateInBoundsGEP(SrcEltType, SrcOp, NewIndices)
+-              : Builder.CreateGEP(SrcEltType, SrcOp, NewIndices);
+-
+-      if (NGEP->getType() == GEP.getType())
+-        return replaceInstUsesWith(GEP, NGEP);
+-      NGEP->takeName(&GEP);
+-
+-      if (NGEP->getType()->getPointerAddressSpace() != GEP.getAddressSpace())
+-        return new AddrSpaceCastInst(NGEP, GEP.getType());
+-      return new BitCastInst(NGEP, GEP.getType());
+-    }
+-  }
++  //if (!isa<BitCastInst>(SrcOp) && GEP.accumulateConstantOffset(DL, Offset) &&
++  //    !isAllocationFn(SrcOp, &TLI)) {
++  //  // If this GEP instruction doesn't move the pointer, just replace the GEP
++  //  // with a bitcast of the real input to the dest type.
++  //  if (!Offset) {
++  //    // If the bitcast is of an allocation, and the allocation will be
++  //    // converted to match the type of the cast, don't touch this.
++  //    if (isa<AllocaInst>(SrcOp)) {
++  //      // See if the bitcast simplifies, if so, don't nuke this GEP yet.
++  //      if (Instruction *I = visitBitCast(*BCI)) {
++  //        if (I != BCI) {
++  //          I->takeName(BCI);
++  //          BCI->getParent()->getInstList().insert(BCI->getIterator(), I);
++  //          replaceInstUsesWith(*BCI, I);
++  //        }
++  //        return &GEP;
++  //      }
++  //    }
++
++  //    if (SrcType->getPointerAddressSpace() != GEP.getAddressSpace())
++  //      return new AddrSpaceCastInst(SrcOp, GEP.getType());
++  //    return new BitCastInst(SrcOp, GEP.getType());
++  //  }
++
++  //  // Otherwise, if the offset is non-zero, we need to find out if there is a
++  //  // field at Offset in 'A's type.  If so, we can pull the cast through the
++  //  // GEP.
++  //  SmallVector<Value*, 8> NewIndices;
++  //  if (findElementAtOffset(SrcType, Offset.getSExtValue(), NewIndices, DL)) {
++  //    Value *NGEP =
++  //        GEP.isInBounds()
++  //            ? Builder.CreateInBoundsGEP(SrcEltType, SrcOp, NewIndices)
++  //            : Builder.CreateGEP(SrcEltType, SrcOp, NewIndices);
++
++  //    if (NGEP->getType() == GEP.getType())
++  //      return replaceInstUsesWith(GEP, NGEP);
++  //    NGEP->takeName(&GEP);
++
++  //    if (NGEP->getType()->getPointerAddressSpace() != GEP.getAddressSpace())
++  //      return new AddrSpaceCastInst(NGEP, GEP.getType());
++  //    return new BitCastInst(NGEP, GEP.getType());
++  //  }
++  //}
+ 
+   return nullptr;
+ }
+diff --git a/llvm/lib/Transforms/Instrumentation/CMakeLists.txt b/llvm/lib/Transforms/Instrumentation/CMakeLists.txt
+index 3b29c3df6..8f3410c6c 100644
+--- a/llvm/lib/Transforms/Instrumentation/CMakeLists.txt
++++ b/llvm/lib/Transforms/Instrumentation/CMakeLists.txt
+@@ -18,6 +18,8 @@ add_llvm_component_library(LLVMInstrumentation
+   ValueProfileCollector.cpp
+   ThreadSanitizer.cpp
+   HWAddressSanitizer.cpp
++  KDFIInstrument.cpp
++  PPACUtility.cpp
+ 
+   ADDITIONAL_HEADER_DIRS
+   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
+diff --git a/llvm/lib/Transforms/Instrumentation/Instrumentation.cpp b/llvm/lib/Transforms/Instrumentation/Instrumentation.cpp
+index dda242492..a10531539 100644
+--- a/llvm/lib/Transforms/Instrumentation/Instrumentation.cpp
++++ b/llvm/lib/Transforms/Instrumentation/Instrumentation.cpp
+@@ -110,6 +110,7 @@ void llvm::initializeInstrumentation(PassRegistry &Registry) {
+   initializeThreadSanitizerLegacyPassPass(Registry);
+   initializeModuleSanitizerCoverageLegacyPassPass(Registry);
+   initializeDataFlowSanitizerLegacyPassPass(Registry);
++  initializeKDFIInstrumentLegacyPassPass(Registry);
+ }
+ 
+ /// LLVMInitializeInstrumentation - C binding for
+diff --git a/llvm/lib/Transforms/Instrumentation/KDFIInstrument.cpp b/llvm/lib/Transforms/Instrumentation/KDFIInstrument.cpp
+new file mode 100644
+index 000000000..3a20ad512
+--- /dev/null
++++ b/llvm/lib/Transforms/Instrumentation/KDFIInstrument.cpp
+@@ -0,0 +1,4020 @@
++#include "llvm/Pass.h"
++#include "llvm/ADT/ArrayRef.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/ADT/Triple.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Constant.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DataLayout.h"
++#include "llvm/IR/DebugLoc.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalAlias.h"
++#include "llvm/IR/GlobalValue.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/InstrTypes.h"
++#include "llvm/IR/Instruction.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/Intrinsics.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Metadata.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Type.h"
++#include "llvm/IR/Use.h"
++#include "llvm/IR/Value.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/Transforms/Utils/ASanStackFrameLayout.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++#include "llvm/Transforms/Utils/PromoteMemToReg.h"
++#include "llvm/Transforms/Instrumentation/KDFIInstrumentPass.h"
++#include "PPACUtility.h"
++#include <algorithm>
++#include <cstdint>
++#include <string>
++#include <tuple>
++#include <fstream>
++#include <regex>
++using namespace llvm;
++#define DEBUG_TYPE "kdfi_instrument"
++
++#define KDFI_DUMP_PATH 
++#define ALLOC_FILE     
++#define DUMP_FUNC_FILE 
++#define LIST_FILE      
++
++#define KDFI_SKIP_FILE 
++#define MTE_SKIP_FILE  
++#define PAC_SKIP_FILE  
++
++
++namespace {
++  enum PType {
++    POBJ,
++    POBJ_NEST,
++    GPOBJ,
++    GPPTR,
++    GPFIELD,
++    LISTGV,
++    GVREF,
++    PREF,
++    PSTACK,
++  };
++
++  enum VType {
++    VTYPE_I, // instruction
++    VTYPE_C, // constantexpr
++    VTYPE_A, // argument
++    VTYPE_G, // globalvariable
++    VTYPE_U //  unknown
++  };
++
++  enum IType {
++    PALLOC,
++    NALLOC,
++    PFREE,
++    PTRLOAD,
++    PTRCMP,
++    PTELOAD,
++    SAFE,
++    UNSAFE,
++    PCOPY,
++    PALLOCA,
++  };
++
++  enum skip_opt {
++      MTE,
++      NOTCMA
++  };
++// kdfi instrument classes
++
++
++bool is_this_cpu_asm(Value *v) {
++  if (!v)
++    return false;
++  if (!isa<CallBase>(v))
++    return false;
++  if (!cast<CallBase>(v)->isInlineAsm())
++    return false;
++
++  auto ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++  auto str = ia->getAsmString();
++  if (str.find("tpidr_el1") != std::string::npos)
++      return true;
++  return false;
++}
++
++bool is_per_cpu_gep(Instruction *ii) {
++  if (!ii)
++    return false;
++
++  if (!isa<GetElementPtrInst>(ii))
++    return false;
++  if (!isa<GlobalVariable>(ii->getOperand(0)))
++    return false;
++  if (cast<GlobalVariable>(ii->getOperand(0))->getName() == "__per_cpu_offset")
++    return true;
++  return false;
++}
++
++/*  class KDFIInstrument */
++class KDFIInstrument {
++private:
++    std::set<StringRef> *KDFIInstrumentFuncSet;
++    FunctionCallee pkeyAllowFunc;
++    FunctionCallee pkeyDisallowFunc;
++    Constant *allowCount;
++    Constant *disallowCount;
++    InstFuncMap dummyCE;
++    CE2FISet ce2fimap;
++
++  createDump creates;
++  checkDump checks;
++  convertDump converts;
++  stripDump strips;
++  mteDump mtes;
++  Inst2intSet mtePhi2op;
++
++  StringSet list_structs;
++  StringSet alloc_funcs, noaccess_funcs;
++  StringSet skip_funcs, wrong_funcs;
++  StringSet kdfi_skip_funcs;
++  StringSet pac_skip_funcs;
++  StringSet ptag_skip_funcs;
++
++  Inst2Uselists priv_ldst;
++
++  FunctionNameMap fmap;
++  Value2ChkInst strip_visited;
++  std::set<Function*> dumpset;
++
++  ValueSet tagged_ptr, tagged_access;
++  ValueSet safe_ptr, unsafe_ptr, safe_access, unsafe_access;
++  ValueSet priv_ptr_access;
++  ValueSet inter_safe_access, inter_unsafe_access;
++  InstructionSet pptr_load, pptr_store, skip_load, skip_store, ptr_load;
++  ValueSet pptr_ref, skip_ref;
++  ValueSet gref, gpobj, gpptr, gvref;
++  FunctionSet pstack_func;
++  std::set<std::pair<GlobalVariable*, int>> gpfield, list_gvs;
++  TypeSet pobj, pobj_nested, pptr_reftype;
++  std::set<std::pair<Instruction*, Indices*>> pptr_copy;
++  StringSet gv_names;
++  std::unordered_map<std::string, int> gv2num;
++
++  const char *const builtinContainerOfFuncName = "__builtin_container_of";
++  const char *const signPACFuncName = "ppac_create";
++  const char *const authPACFuncName = "ppac_check";
++  const char *const convertKDFIFuncName = "ppac_strip";
++  const char *const stripPACFuncName = "ppac_strip";
++  const char *const copyPACFuncName = "ppac_copy";
++  const char *const enforce0KDFIFuncName = "enforce_zero";
++  const char *const setnKDFIFuncName = "set_tag_n";
++  const char *const setpKDFIFuncName = "set_tag_p";
++  const char *const setfKDFIFuncName = "set_tag_f";
++  const char *const allocMTEFuncName = "alloc_mte";
++  const char *const kmemMTEFuncName = "kmem_cache_mte";
++  const char *const allocNormalFuncName = "alloc_normal";
++  const char *const allocMTEPercpuFuncName = "alloc_mte_percpu";
++  const char *const allocNormalPercpuFuncName = "alloc_normal_percpu";
++
++  Function *tag_global_func;
++  Function *sign_global_func;
++  Function *sign_list_func;
++
++  FunctionCallee xorPACFunc;
++  FunctionCallee signPACFunc;
++  FunctionCallee authPACFunc;
++  FunctionCallee convertKDFIFunc;
++  FunctionCallee stripPACFunc;
++  FunctionCallee copyPACFunc;
++  FunctionCallee enforce0KDFIFunc;
++  FunctionCallee setnKDFIFunc;
++  FunctionCallee setpKDFIFunc;
++  FunctionCallee setfKDFIFunc;
++  FunctionCallee allocMTEFunc;
++  FunctionCallee kmemMTEFunc;
++  FunctionCallee allocNormalFunc;
++  FunctionCallee allocMTEPercpuFunc;
++  FunctionCallee allocNormalPercpuFunc;
++
++  bool testmode = false;
++  int cred_code = 12;
++  int sock_code = 100;
++  ValueSet skip_mte;
++
++public:
++  KDFIInstrument() {}
++  static char ID;
++  Module *M;
++  LLVMContext *C;
++  const DataLayout *DL;
++  Type *VoidTy;
++  Type *Int8Ty;
++  Type *Int32Ty;
++  Type *Int64Ty;
++  Type *Int8PtrTy;
++  Type *Int32PtrTy;
++  Type *Int64PtrTy;
++
++  Inst2Int mte_alloc, normal_alloc, mte_free;
++  InstructionSet allocset;
++  InstructionSet mte_alloca;
++  InstructionSet mte_priv;
++  InstructionSet mte_skip;
++  InstructionSet pac_auth;
++  InstructionSet pac_sign;
++  InstructionSet pac_strip;
++  InstructionSet pte_inst;
++  InstructionSet ptr_cmp;
++  InstructionSet ptr_inst;
++  ValueSet ptr_gv;
++  StringSet mte_skip_funcs;
++  StringSet notcma_funcs;
++  std::string kdfi_dump_path = "";
++
++  bool is_pobj(Type *ty) {
++    if (pobj.count(ty))
++      return true;
++    return false;
++  }
++
++  bool is_pptr(Type *ty) {
++    if (pobj.count(ty))
++      return true;
++    return false;
++  }
++
++  bool is_nested_pobj(Type *ty) {
++    if (pobj_nested.count(ty))
++      return true;
++    return false;
++  }
++
++    bool Initialize(Module &module) {
++      this->M = &module;
++      C = &(module.getContext());
++      DL = &module.getDataLayout();
++      VoidTy     = Type::getVoidTy(*C);
++      Int8Ty     = Type::getInt8Ty(*C);
++      Int32Ty    = Type::getInt32Ty(*C);
++      Int64Ty    = Type::getInt64Ty(*C);
++      Int8PtrTy  = Type::getInt8PtrTy(*C);
++      Int32PtrTy = Type::getInt32PtrTy(*C);
++      Int64PtrTy = Type::getInt64PtrTy(*C);
++
++      if (std::getenv("PETAL_ORI")) {
++        //loadListGlobals(LIST_FILE);
++        //sign_list_func = M->getFunction("kdfi_sign_list_globals");
++        sign_list_func = nullptr;
++        return false;
++      }
++
++      list_structs.insert("struct.list_head");
++      list_structs.insert("struct.hlist_node");
++      list_structs.insert("struct.hlist_head");
++      list_structs.insert("struct.hlist_bl_head");
++      list_structs.insert("struct.hlist_bl_node");
++      list_structs.insert("struct.llist_node");
++      list_structs.insert("struct.rb_node");
++      list_structs.insert("struct.rb_root_cached");
++      list_structs.insert("struct.wake_q_node");
++      list_structs.insert("struct.callback_head");
++      list_structs.insert("struct.plist_node");
++      list_structs.insert("struct.llist_head");      
++      list_structs.insert("struct.list_lru");
++      list_structs.insert("struct.__call_single_data");
++
++
++      alloc_funcs.insert("kmem_cache_alloc");
++      alloc_funcs.insert("kmem_cache_alloc_trace");
++      alloc_funcs.insert("kmem_cache_alloc_node");
++      alloc_funcs.insert("kmem_cache_alloc_node_trace");
++      alloc_funcs.insert("kmem_cache_alloc_lru");
++      alloc_funcs.insert("kzalloc");
++      alloc_funcs.insert("__kmalloc");
++      alloc_funcs.insert("__kmalloc_node");
++      alloc_funcs.insert("__kmalloc_track_caller");
++      alloc_funcs.insert("__kmalloc_node_track_caller");
++      alloc_funcs.insert("kvmalloc_node");
++      alloc_funcs.insert("vmalloc");
++      alloc_funcs.insert("__vmalloc");
++      alloc_funcs.insert("kcalloc");
++      //alloc_funcs.insert("__alloc_percpu");
++      alloc_funcs.insert("pcpu_alloc");
++      alloc_funcs.insert("memblock_alloc_internal");
++      alloc_funcs.insert("__get_free_pages");
++      alloc_funcs.insert("kmalloc_array");
++
++      skip_funcs.insert("kaslr_early_init");
++      skip_funcs.insert("bcmp");
++      skip_funcs.insert("sort_r");
++      skip_funcs.insert("skip_spaces");
++      skip_funcs.insert("pfn_valid");
++      skip_funcs.insert("mte_set_tcma_noreturn");
++      skip_funcs.insert("alloc_normal");
++      skip_funcs.insert("alloc_mte");
++
++      tag_global_func = M->getFunction("kdfi_tag_globals");
++      sign_global_func = M->getFunction("kdfi_sign_globals");
++
++      // dump function
++      std::ifstream func_file;
++      func_file.open(DUMP_FUNC_FILE);
++      if (func_file.is_open()) {
++        std::string line;
++        while(std::getline(func_file, line)) {
++          if (auto func = getFunction(line))
++            dumpset.insert(func);
++        }
++        func_file.close();
++      }
++      if (dumpset.size()) {
++        for (auto f : dumpset) {
++          errs() <<"before\n";
++          errs() << *f << "\n";
++        }
++      }
++
++      // instrumentation by function
++      initialize_func();
++      // instrumentation by inline assembly
++      if (std::getenv("KDFI_INLINE"))
++        initialize_inline();
++
++
++      std::ifstream dump_file;
++      dump_file.open(KDFI_DUMP_PATH);
++      if (dump_file.is_open()) {
++        std::getline(dump_file, kdfi_dump_path);
++      }
++      dump_file.close();
++     // load kdfi skip functions
++      std::ifstream file0;
++      file0.open(KDFI_SKIP_FILE);
++      if (file0.is_open()) {
++        std::string line;
++        while(std::getline(file0, line)) {
++          kdfi_skip_funcs.insert(line);
++        }
++      } else {
++        print_debug("cannot open kdfi skip file");
++      }
++
++      // load mte skip functions
++      std::ifstream file_p;
++      file_p.open(MTE_SKIP_FILE);
++      if (file_p.is_open()) {
++        std::string line;
++        while(std::getline(file_p, line)) {
++          mte_skip_funcs.insert(line);
++        }
++      } else {
++        print_debug("cannot open mte skip file");
++      }
++
++      //// load pac skip functions
++      //std::ifstream file1;
++      //file1.open(PAC_SKIP_FILE);
++      //if (file1.is_open()) {
++      //  std::string line;
++      //  while(std::getline(file1, line)) {
++      //    pac_skip_funcs.insert(line);
++      //  }
++      //} else {
++      //  print_debug("cannot open pac skip file");
++      //}
++
++      // load alloc functions
++      std::ifstream file;
++      file.open(ALLOC_FILE);
++      if (file.is_open()) {
++        std::string line;
++        while(std::getline(file, line)) {
++          alloc_funcs.insert(line);
++        }
++      } else {
++        print_debug("cannot open alloc file");
++      }
++
++      loadKDFIDump(kdfi_dump_path);
++      return false;
++    }
++    void loadKDFIDump(std::string file) {
++
++      loadPriv(file);
++      loadAlloca(file);
++      loadAlloc(file);
++      loadAccess(file);
++      return;
++
++      loadAlloc(file);
++    }
++    bool is_pac_skip(Value *v) {
++      if (auto ci = dyn_cast<CallInst>(v)) {
++        if (get_callee_function_name(ci) == "ppac_skip") {
++            return true;
++        }
++      }
++      return false;
++    }
++    bool is_set_ptag(Instruction *ii) {
++      if (auto ci = dyn_cast<CallInst>(ii)) {
++        if (get_callee_function_name(ci).str() == "set_pointer_tag")
++          return true;
++      }
++      else if (isa<CastInst>(ii))
++        if (isa<Instruction>(ii->getOperand(0)))
++          return is_set_ptag(cast<Instruction>(ii->getOperand(0)));
++      return false;
++    }
++
++    bool is_cpu_ptr(Instruction *i) {
++      if (!isa<LoadInst>(i))
++        return false;
++
++      if (isa<LoadInst>(i))
++        if (is_per_cpu_gep(dyn_cast<Instruction>(i->getOperand(0))))
++          return true;
++
++      return false;
++
++      // never reach here
++
++      if (!isa<LoadInst>(i) &&
++          !isa<CastInst>(i) &&
++          !isa<GetElementPtrInst>(i) &&
++          i->getOpcode() != Instruction::Add)
++         return false;
++      Instruction *add = nullptr;
++      if (i->getOpcode() == Instruction::Add) {
++        add = i;
++      } else {
++        ValueList worklist;
++        ValueSet visited;
++        worklist.push_back(i);
++        while(worklist.size()) {
++          auto v = worklist.back();
++          worklist.pop_back();
++          if (visited.count(v))
++            continue;
++          visited.insert(v);
++
++          if (auto bop = dyn_cast<BinaryOperator>(v)) {
++            if (bop->getOpcode()==Instruction::Add) {
++              add=bop;
++              break;
++            }
++          }
++
++          for (auto u : v->users()) {
++            if (isa<GetElementPtrInst>(u) ||
++                isa<CastInst>(u) || 
++                isa<PHINode>(u) ||
++                isa<BinaryOperator>(u))
++              worklist.push_back(u);
++          }
++        }
++      }
++
++      if (!add)
++        return false;
++      
++      auto offset = add->getOperand(0);
++      if (is_this_cpu_asm(offset)) {
++          return true;
++      } else if (isa<LoadInst>(offset)) {
++        if (is_per_cpu_gep(dyn_cast<Instruction>(cast<User>(offset)->getOperand(0))))
++          return true;
++      }
++      return false;
++    }
++
++    bool is_skip_mte(ValueList *ul) {
++      if (skip_mte.count(ul->back()))
++        return true;
++      return false;
++    }
++    bool is_skip_ptr(Value *val) {
++      if (auto sty = get_pstr_type(val)) {
++        auto sname = sty->getName();
++        if (sname.startswith("struct.pcpu_block_md") ||
++            sname.startswith("struct.pcpu_chunk") ||
++            sname.startswith("struct.zone") ||
++            sname.startswith("struct.page") ||
++            sname.startswith("struct.folio") ||
++            sname.startswith("struct.pglist_data") ||
++            sname.startswith("struct.per_cpu_pages") ||
++            sname.startswith("struct.free_area")
++        ) return true;
++      }
++      if (auto li = dyn_cast<LoadInst>(val)) {
++        if (auto gv = dyn_cast<GlobalVariable>(li->getOperand(0))) {
++          if (gv->getName().startswith("pcpu_")) {
++            return true;
++          }
++        }
++      }
++      return false;
++    }
++
++  void initialize_func();
++  void initialize_inline();
++  void loadListGlobals(std::string);
++  void loadPriv(std::string);
++  void loadPrivInstance(std::ifstream&, PType);
++  void loadAlloca(std::string);
++  void loadAlloc(std::string);
++  int loadAllocInstance(std::ifstream&, IType);
++  void loadPteLoad(std::string);
++  void loadPtrCmp(std::string);
++  void loadAccess(std::string);
++  void loadPtrLoad(std::string);
++  int loadInstance(std::ifstream&, IType);
++  void mteConditional();
++
++  std::string get_op(std::string);
++  std::string strip_md(std::string);
++  std::string strip_align(std::string);
++  std::string strip_struct(std::string);
++  std::string strip_arg(std::string);
++  std::string strip_bitcast(std::string);
++  bool is_same(Value*, std::string, bool align = false);
++  bool is_list_type(Type*);
++  StructType *get_list_type(Type*);
++  bool is_alloc_func(std::string);
++  bool is_alloc_inst(Value *);
++  StructType *get_cast_pstr_type(Value*);
++
++  bool is_kdfi_skip_func(std::string);
++  bool is_pac_skip_func(std::string);
++  bool is_mte_skip_func(std::string);
++  bool is_ptag_skip_func(std::string);
++
++  Function *get_kdfi_skip_func(std::string);
++  std::string getFuncName(std::string);
++  int getNum(std::string);
++  Indices *getIndices(std::string);
++  int getOpNum(std::string, std::string);
++
++  VType getType(std::string);
++  Value *getValue(Function*, std::string, Value* prev=nullptr, int prev_op = -1,
++                  unsigned opNum = 0);
++  Instruction *getInst(Function*, std::string, Value *prev = nullptr, int prev_op = -1,
++                       unsigned opNum = 0);
++  Value *getCE(Function*, std::string);
++  Argument *getArg(Function*, std::string);
++  GlobalVariable *getGV(Function*, std::string);
++  Function *getFunction(std::string);
++
++  void kdfi_instrumentation();
++  void load_internal_gvs(std::string);
++  void instrument_alloc();
++  void instrument_pointer_access();
++  void instrument_pointer_copy();
++  void instrument_tag_check();
++  void _insert_mte_alloca(Instruction*);
++  void _insert_mte_set(Instruction*, int, IType);
++  void _insert_pac_copy(Instruction *i, Indices *idx);
++  void _insert_enforce_zero(Instruction*);
++
++  void register_set_tag(Instruction *, int, unsigned long long);
++  void _instrument_set_tag(Instruction*, int, unsigned long long);
++  void _insert_pac_sign(Instruction*, int, int);
++
++  void instrument_unsafe_access();
++
++  void reset_gv(std::map<Constant*,Constant*> *modmap, Constant *c);
++  void reset_nullcmp(Value *auth, Instruction *src);
++  void _insert_pac_auth(Instruction*, int, int);
++  void tag_globals(Module&);
++  void sign_globals(Module&);
++  void sign_lists(Module&);
++
++  void collect(Value*, unsigned, unsigned, std::set<unsigned>*, ValueSet*,
++             UseSet *visited=nullptr);
++  void collect_alloc(Module&);
++  void collect_alloca(Module&);
++  void collect_gref(Module&);
++  void collect_ptr(Module&);
++  void collect_ptr_deref(Module&);
++  void collect_pptr_ref(Module&);
++  void collect_pptr_access(Module&);
++
++  bool Run(Module &M);
++  bool IsInterestingFunc(StringRef);
++  bool doKDFIInstrumentation(Function*);
++
++  bool is_noaccess(std::string fname) {
++    if (noaccess_funcs.count(fname))
++      return true;
++    return false;
++  }
++}; /*  class KDFIInstrument */
++
++  bool is_nullcmp(Value *v) {
++    if (auto icmp = dyn_cast<ICmpInst>(v)) {
++      if (auto c = dyn_cast<Constant>(icmp->getOperand(1))) {
++        if (c->isNullValue()) {
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
++  void KDFIInstrument::initialize_func() {
++    xorPACFunc =
++       llvm::InlineAsm::get(FunctionType::get(Int64Ty, {Int64Ty}, false),
++                           "mov x14, $1\n"
++                           "eor x14, x14, #0x1\neor x14, x14, #0x1\neor x14, x14, #0x1\neor x14, x14, #0x1\n" // XOR
++                           "mov $0, x14\n",
++                           "=r,r,~{x14},~{cc}", false);
++    //pseudoPACFunc =
++    //   llvm::InlineAsm::get(FunctionType::get(Int64Ty, {Int64Ty}, false),
++    //                       "mov x14, $1\n"
++    //                       "eor x14, x14, #0x1\neor x14, x14, #0x1\neor x14, x14, #0x1\neor x14, x14, #0x1\n" // XOR
++    //                       "mov $0, x14\n",
++    //                       "=r,r,~{x14},~{cc}", true);
++
++    signPACFunc = M->getOrInsertFunction(signPACFuncName,
++                                            Int8PtrTy,
++                                            Int8PtrTy,
++                                            Int64Ty);
++    authPACFunc = M->getOrInsertFunction(authPACFuncName,
++                                           Int8PtrTy,
++                                           Int8PtrTy,
++                                           Int64Ty);
++    convertKDFIFunc = M->getOrInsertFunction(convertKDFIFuncName,
++                                             Int8PtrTy,
++                                             Int8PtrTy,
++                                             Int64Ty);
++    stripPACFunc = M->getOrInsertFunction(stripPACFuncName,
++                                           Int8PtrTy,
++                                           Int8PtrTy);
++    copyPACFunc = M->getOrInsertFunction(copyPACFuncName,
++                                            Int8PtrTy, 
++                                            Int8PtrTy,
++                                            Int32Ty,
++                                            Int32PtrTy,
++                                            Int32Ty);
++    setnKDFIFunc =
++      llvm::InlineAsm::get(FunctionType::get(Int8PtrTy, {Int8PtrTy}, false),
++                           "and $0, $1, 0xf0ffffffffffffff\n",
++                           "=r,r", false);
++
++    //setnKDFIFunc = M->getOrInsertFunction(setnKDFIFuncName,
++    //                                      Int8PtrTy,
++    //                                      Int8PtrTy);
++    enforce0KDFIFunc = M->getOrInsertFunction(enforce0KDFIFuncName,
++                                          Int8PtrTy,
++                                          Int8PtrTy);
++    setpKDFIFunc = M->getOrInsertFunction(setpKDFIFuncName,
++                                          Int8PtrTy,
++                                          Int8PtrTy);
++    setfKDFIFunc = M->getOrInsertFunction(setfKDFIFuncName,
++                                          Int8PtrTy,
++                                          Int8PtrTy);
++    allocMTEFunc = M->getOrInsertFunction(allocMTEFuncName,
++                                          Int8PtrTy,
++                                          Int8PtrTy,
++                                          Int64Ty);
++    kmemMTEFunc = M->getOrInsertFunction(kmemMTEFuncName,
++                                          Int8PtrTy,
++                                          Int8PtrTy,
++                                          Int8PtrTy);
++    allocNormalFunc = M->getOrInsertFunction(allocNormalFuncName,
++                                             VoidTy,
++                                             Int8PtrTy,
++                                             Int64Ty);
++    allocMTEPercpuFunc = M->getOrInsertFunction(allocMTEPercpuFuncName,
++                                                Int8PtrTy,
++                                                Int8PtrTy);
++    allocNormalPercpuFunc = M->getOrInsertFunction(allocNormalPercpuFuncName,
++                                                   Int8PtrTy,
++                                                   Int8PtrTy);
++  }
++
++  void KDFIInstrument::initialize_inline() {
++    signPACFunc =
++      llvm::InlineAsm::get(signPACFunc.getFunctionType(),
++                           "mov $0, $1\nlsr x14, $1, #60\ncmp x14, #0xf\nb.cc end${:uid}"
++                           "\npacda x14, x15"
++                           "\nend${:uid}:\n",
++                           "=r,r,r,~{x14},~{cc}", true);
++                           //"\nadd x14, x14, #0x1\nadd x14, x14, #0x1\nadd x14, x14, #0x1\nadd x14, x14, #0x1\nadd x14, x14, #0x1" // PAC
++    authPACFunc =
++      llvm::InlineAsm::get(authPACFunc.getFunctionType(),
++                           "mov $0, $1\nlsr x14, $1, #60\ncmp x14, #0xf\nb.cc end${:uid}"
++                           "\nautda x14, x15"
++                           "\nend${:uid}:\n",
++                           "=r,r,r,~{x14},~{cc}", true);
++                           //"\nadd x14, x14, #0x1\nadd x14, x14, #0x1\nadd x14, x14, #0x1\nadd x14, x14, #0x1\nadd x14, x14, #0x1" // AUT
++    stripPACFunc =
++      llvm::InlineAsm::get(stripPACFunc.getFunctionType(),
++                           "mov $0, $1\nlsr x14, $1, #60\ncmp x14, #0xf\nb.cc end${:uid}"
++                           "\nxpacd $x14"
++                           "\nend${:uid}:\n",
++                           "=r,r,~{x14},~{cc}", true);
++                           //"\nadd x14, x14, #0x1\nadd x14, x14, #0x1" // XPAC
++
++    setfKDFIFunc =
++      llvm::InlineAsm::get(setnKDFIFunc.getFunctionType(),
++                           "orr x14, $1, 0xf00000000000000\nmov $0, $1\n",
++                           "=r,r,~{x14}", false);
++
++    setfKDFIFunc =
++      llvm::InlineAsm::get(setfKDFIFunc.getFunctionType(),
++                           "and x14, $1, 0xf0ffffffffffffff\nmov $0, $1\n",
++                           "=r,r,~{x14},~{cc}", true);
++
++//    allocMTEFunc =
++//      llvm::InlineAsm::get(allocMTEFunc.getFunctionType(),
++//                           "mov $0, $1\ncbz $1, end${:uid}\ncbz $2, end${:uid}"
++//                           "\nmov x14, $1\nmov x15, $2"
++//                           "\nnop\nnop\nnop\nnop\nnop" // IRG
++//                           "\nset${:uid}:nop" // STG
++//                           "\nadd x14, x14, #0x10\nsubs x15, x15, #0x10\nb.gt set${:uid}\nend${:uid}:\n",
++//                           "=r,r,r,~{x14},~{x15},~{memory},~{cc}", true);
++//
++//    allocNormalFunc =
++//      llvm::InlineAsm::get(allocNormalFunc.getFunctionType(),
++//                           "cbz $0, end${:uid}\ncbz $1, end${:uid}"
++//                           "\nand x14, $0, #0xfffffffffffffff0\nand x14, x14, #0xf0ffffffffffffff"
++//                           "\nadd x15, $1, #0x10\nand x15, x15, #0xfffffffffffffff0"
++//                           "\nset${:uid}:nop" // STG
++//                           "\nadd x14, x14, #0x10\nsubs x15, x15, #0x10\nb.gt set${:uid}\nend${:uid}:\n",
++//                           "r,r,~{x14},~{x15},~{memory},~{cc}", true);
++
++    allocMTEFunc =
++      llvm::InlineAsm::get(allocMTEFunc.getFunctionType(),
++                           "mov $0, $1\ncbz $1, end${:uid}\ncbz $2, end${:uid}"
++                           "\nmov x14, $1\nmov x15, $2"
++                           "\nirg x14, x14"
++                           "\nset${:uid}:\nstg x14, [x14]" // STG
++                           "\nadd x14, x14, #0x10\nsubs x15, x15, #0x10\nb.gt set${:uid}\nend${:uid}:\n",
++                           "=r,r,r,~{x14},~{x15r,~{memory},~{cc}", true);
++
++    allocNormalFunc =
++      llvm::InlineAsm::get(allocNormalFunc.getFunctionType(),
++                           "cbz $0, end${:uid}\ncbz $1, end${:uid}"
++                           "\nand x14, $0, #0xfffffffffffffff0\nand x14, x14, #0xf0ffffffffffffff"
++                           "\nadd x15, $1, #0x10\nand x15, x15, #0xfffffffffffffff0"
++                           "\nset${:uid}:\nstg x14, [x14]" // STG
++                           "\nadd x14, x14, #0x10\nsubs x15, x15, #0x10\nb.gt set${:uid}\nend${:uid}:\n",
++                           "r,r,~{x14},~{x15},~{memory},~{cc}", true);
++
++  }
++  void KDFIInstrument::loadListGlobals(std::string file) {
++  std::ifstream dump;
++  bool header = false;
++  int num=0;
++  int count=0;
++  dump.open(file);
++
++  if (dump.is_open()) {
++    std::string line;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 14) != "global lfield ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header) 
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, LISTGV);
++  }
++
++  out:
++    dump.close();
++  }
++
++  void KDFIInstrument::loadPriv(std::string file) {
++  std::ifstream dump;
++  bool header = false;
++  int num=0;
++  int count=0;
++  dump.open(file);
++
++  if (dump.is_open()) {
++    std::string line;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 5) != "pobj ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, POBJ);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 12) != "nested pobj ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, POBJ_NEST);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 12) != "global pobj ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, GPOBJ);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 12) != "global pptr ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, GPPTR);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 14) != "global pfield ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, GPFIELD);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 13) != "global gvref ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, GVREF);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 9) != "pptr ref ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, PREF);
++
++    header=false;
++    while(std::getline(dump, line)) {
++      if (line.substr(0, 11) != "priv stack ")
++        continue;
++      else {
++        header =true;
++        break;
++      }
++    }
++    if (!header)
++      goto out;
++
++    num = getNum(line);
++    for (int i=0; i<num; i++)
++      loadPrivInstance(dump, PSTACK);
++  }
++ out:
++  dump.close();
++}
++void KDFIInstrument::loadPrivInstance(std::ifstream& dump, PType opt) {
++    std::string line;
++    std::string sname;
++    bool is_internal=false;
++    StructType *sty = nullptr;
++    GlobalVariable *gv = nullptr;
++    std::getline(dump, line);
++    if (line.substr(0, 3) != " - ")
++      return;
++    sname = line.substr(3);
++    if (opt==POBJ || opt==POBJ_NEST || opt == PREF) {
++      sty = StructType::getTypeByName(*C, sname);
++      if (!sty)
++        return;
++    } else if (opt == PSTACK) {
++      auto func = getFunction(sname);
++      if (func)
++        pstack_func.insert(func);
++    } else { // GPOBJ, GPPTR, GVREF, GPFIELD
++      if (opt==GPFIELD || opt == LISTGV) {
++        sname = sname.substr(0,sname.find("+"));
++      }
++      for (auto gi = M->global_begin(); gi != M->global_end(); ++gi) {
++        if (gi->getName()==sname) {
++          gv = &*gi;
++          break;
++        }
++
++        auto gname = gi->getName();
++        //if (gname.contains("_kdfi")) {
++        //  gname = gname.take_front(gname.find("_kdfi"));
++        //}
++        //std::smatch match;
++        //std::regex_match(sname, match, std::regex("^([^0-9]+)\\.([0-9]+)$"));
++        //if (match.size()==3) {
++        //  sname = match[1].str();
++        //  is_internal=true;
++        //}
++
++        if (sname == gname) {
++          gv = &*gi;
++          break;
++        }
++      }
++
++      if (opt==GPOBJ) {
++        if (tag_global_func && !tag_global_func->isDeclaration()) {
++          if (gv2num[sname]>1 || is_internal) {
++            auto cnt = gv2num[sname];
++            for (int i=0; i < cnt; ++i) {
++              gv = new GlobalVariable(*M, Int64Ty, false,
++                                    GlobalValue::ExternalLinkage, nullptr,
++                                    sname+"_kdfi"+std::to_string(i));
++              errs() <<"new name: " << gv->getName() << "\n";
++              //gv->setAlignment(Align(16));
++              gpobj.insert(gv);
++            }
++          } else {
++            gv = new GlobalVariable(*M, Int64Ty, false,
++                                GlobalValue::ExternalLinkage, nullptr, sname);
++            gv->setAlignment(Align(16));
++          }
++        } else {
++          if (gv) {
++            gv->setLinkage(GlobalVariable::ExternalLinkage);
++            //gv->setAlignment(Align(16));
++          }
++        }
++      }
++      else if (opt==GPFIELD) {
++        if (sign_global_func && !sign_global_func->isDeclaration()) {
++          auto sint = line.substr(line.find("+"));
++          int offset = getNum(sint);
++          if (!gv) {
++            if (gv2num[sname]>1 || is_internal) {
++              int cnt = gv2num[sname];
++              for (int i=0; i < cnt; ++i) {
++                gv = new GlobalVariable(*M, Int64Ty, false,
++                                    GlobalValue::ExternalLinkage, nullptr,
++                                    sname+"_kdfi"+std::to_string(i));
++                errs() <<"new name: " << gv->getName() << "\n";
++                gpfield.insert(std::make_pair(gv, offset));
++              }
++            } else {
++              gv = new GlobalVariable(*M, Int64Ty, false,
++                                  GlobalValue::ExternalLinkage, nullptr, sname);
++            }
++          }
++          gpfield.insert(std::make_pair(gv, offset));
++        } else {
++          if (gv) {
++            gv->setLinkage(GlobalVariable::ExternalLinkage);
++          }
++        }
++      }
++      else if (opt==LISTGV) {
++        if (sign_list_func) {
++          auto sint = line.substr(line.find("+"));
++          int offset = getNum(sint);
++          if (!gv) {
++            gv = new GlobalVariable(*M, Int64Ty, false,
++                          GlobalValue::ExternalLinkage, nullptr, sname);
++          }
++          list_gvs.insert(std::make_pair(gv, offset));
++        } else {
++          if (gv) {
++            gv->setLinkage(GlobalVariable::ExternalLinkage);
++          }
++        }
++      }
++    }
++
++    if (opt == POBJ) {
++      pobj.insert(sty);
++      pptr_reftype.insert(sty->getPointerTo()->getPointerTo());
++    }
++    else if (opt == POBJ_NEST)
++      pobj_nested.insert(sty);
++    else if (opt == PREF) {
++      pptr_reftype.insert(sty);
++    }
++    else if (opt == GPOBJ) {
++      if (gv)
++        gpobj.insert(gv);
++    }
++    else if (opt==GPPTR) {
++      if (gv) {
++        gpptr.insert(gv);
++      }
++    } else if (opt==GVREF) {
++      if (gv)
++        gvref.insert(gv);
++    }
++}
++
++ void KDFIInstrument::loadAlloc(std::string file) {
++    //print_debug("loadAlloc");
++    std::ifstream dump;
++    bool header = false;
++    dump.open(file);
++
++    if (dump.is_open()) {
++
++      std::string line;
++      while(std::getline(dump, line)) {
++        if (line.substr(0, 9) != "mte alloc")
++          continue;
++        else {
++          header =true;
++          break;
++        }
++      }
++      if (!header)
++        goto out;
++
++      int num = getNum(line);
++      int count = 0;
++      while (count < num) {
++        count += loadAllocInstance(dump, PALLOC);
++      }
++
++      // header = false;
++      // while(std::getline(dump, line)) {
++      //   if (line.substr(0, 12) != "normal alloc")
++      //     continue;
++      //   else {
++      //     header = true;
++      //     break;
++      //   }
++      // }
++      // if (!header)
++      //   goto out;
++
++      // num = getNum(line);
++      // count = 0;
++      // while (count < num) {
++      //   count += loadAllocInstance(dump, NALLOC);
++      // }
++
++      header = false;
++      while(std::getline(dump, line)) {
++        if (line.substr(0, 8) != "mte free")
++          continue;
++        else {
++          header = true;
++          break;
++        }
++      }
++      if (!header)
++        goto out;
++
++      num = getNum(line);
++      count = 0;
++      while (count < num) {
++        count += loadAllocInstance(dump, PFREE);
++      }
++    }
++
++out:
++    dump.close();
++  }
++
++  int KDFIInstrument::loadAllocInstance(std::ifstream& dump, IType type) {
++    std::string line, line2;
++    std::string fname;
++    Function* func;
++    Value *src;
++    Value *dest;
++    int code;
++    int count = 0;
++    std::getline(dump, line);
++
++    fname = getFuncName(line);
++    func = getFunction(fname);
++    if (!func) {
++      while(true) {
++        std::getline(dump, line);
++        if (!line.compare(""))
++          break;
++        std::getline(dump, line2);
++        ++count;
++      }
++      return count;
++    }
++    if (func->isDeclaration() || func->isIntrinsic() || !func->hasName()) {
++      while(true) {
++        std::getline(dump, line);
++        if (!line.compare(""))
++          break;
++        std::getline(dump, line2);
++        ++count;
++      }
++      return count;
++    }
++    if (skip_funcs.count(fname) || wrong_funcs.count(fname)) {
++      while(true) {
++        std::getline(dump, line);
++        if (!line.compare(""))
++          break;
++        std::getline(dump, line2);
++        ++count;
++      }
++        return count;
++    }
++    if (std::distance(inst_begin(func), inst_end(func)) == 1) {
++      wrong_funcs.insert(func->getName().str());
++      while(true) {
++        std::getline(dump, line);
++        if (!line.compare(""))
++          break;
++        std::getline(dump, line2);
++        ++count;
++      }
++      return count;
++    }
++
++    std::getline(dump, line);
++    std::getline(dump, line2);
++    count++;
++    while (true) {
++        src = getValue(func, line);
++        if (!src) {
++          print_error(line, func, "no src");
++          std::getline(dump, line);
++          if (!line.compare(""))
++            break;
++          std::getline(dump, line2);
++          ++count;
++          continue;
++        }
++
++        if (line2.find("size    : ") == std::string::npos) {
++            print_error(line, func, "no size");
++            std::getline(dump, line);
++            if (!line.compare(""))
++              break;
++            std::getline(dump, line2);
++            ++count;
++            continue;
++        }
++
++        int size = getNum(line2);
++        Instruction *srcI = cast<Instruction>(src);
++        if (type == PALLOC) {
++          if (dumpset.count(func)) {
++            print_debug(srcI, nullptr, "mte_alloc");
++          }
++          mte_alloc[srcI] = size;
++        }
++        else if (type == NALLOC) {
++          if (dumpset.count(func)) {
++            print_debug(srcI, nullptr, "normal_alloc");
++          }
++          normal_alloc[srcI] =  size;
++        } else if (type == PFREE) {
++          mte_free[srcI] = size;
++        }
++        std::getline(dump, line);
++        if (!line.compare(""))
++          break;
++        std::getline(dump, line2);
++        count++;
++
++    }
++    return count;
++  }
++
++  void KDFIInstrument::loadAlloca(std::string file) {
++    std::ifstream dump;
++    bool header = false;
++    int num, count;
++
++    dump.open(file);
++
++    if (dump.is_open()) {
++        std::string line;
++        while(std::getline(dump, line)) {
++          if (line.find("mte alloca") == std::string::npos)
++              continue;
++          else {
++              header =true;
++              break;
++          }
++        }
++        if (!header)
++            goto out;
++
++        int num = getNum(line);
++        int count = 0;
++        while(count < num) {
++            count += loadInstance(dump, PALLOCA);
++        }
++    }
++out:
++    dump.close();
++  }
++
++  void KDFIInstrument::loadPteLoad(std::string file) {
++    std::ifstream dump;
++    bool header = false;
++    dump.open(file);
++    if (dump.is_open()) {
++        std::string line;
++        while(std::getline(dump, line)) {
++        if (line.find("dump pte load") == std::string::npos)
++            continue;
++        else {
++            header =true;
++            break;
++        }
++        }
++        if (!header)
++            goto out;
++
++        int num = getNum(line);
++        int count = 0;
++        while(count < num) {
++            count += loadInstance(dump, PTELOAD);
++        }
++    }
++out:
++    dump.close();
++  }
++
++
++  void KDFIInstrument::loadPtrCmp(std::string file) {
++    std::ifstream dump;
++    bool header = false;
++    dump.open(file);
++    if (dump.is_open()) {
++        std::string line;
++        while(std::getline(dump, line)) {
++        if (line.find("dump pointer cmp") == std::string::npos)
++            continue;
++        else {
++            header =true;
++            break;
++        }
++        }
++        if (!header)
++            goto out;
++
++        int num = getNum(line);
++        int count = 0;
++        while(count < num) {
++            count += loadInstance(dump, PTRCMP);
++        }
++    }
++out:
++    dump.close();
++  }
++
++  void KDFIInstrument::loadAccess(std::string file) {
++    std::ifstream dump;
++    bool header = false;
++    int num, count;
++
++    dump.open(file);
++
++    if (dump.is_open()) {
++      std::string line;
++     while(std::getline(dump, line)) {
++       if (line.find("safe access") == std::string::npos)
++         continue;
++       else {
++         header =true;
++         break;
++       }
++     }
++     if (!header)
++       goto out;
++
++     num = getNum(line);
++     count = 0;
++
++     while(count < num) {
++       count += loadInstance(dump, SAFE);
++     }
++
++     while(std::getline(dump, line)) {
++       if (line.find("unsafe access") == std::string::npos)
++         continue;
++       else {
++         header =true;
++         break;
++       }
++     }
++     if (!header)
++       goto out;
++
++     num = getNum(line);
++     count = 0;
++
++     while(count < num) {
++       count += loadInstance(dump, UNSAFE);
++     }
++
++      while(std::getline(dump, line)) {
++        if (line.find("ptr copy") == std::string::npos)
++          continue;
++        else {
++          header =true;
++          break;
++        }
++      }
++      if (!header) {
++        goto out;
++      }
++
++      num = getNum(line);
++      count = 0;
++
++      while(count < num) {
++        count += loadInstance(dump, PCOPY);
++      }
++
++    }
++  out:
++    dump.close();
++  }
++
++
++  void KDFIInstrument::loadPtrLoad(std::string file) {
++    std::ifstream dump;
++    bool header = false;
++    dump.open(file);
++    if (dump.is_open()) {
++        std::string line;
++        while(std::getline(dump, line)) {
++        if (line.find("dump pointer load") == std::string::npos)
++            continue;
++        else {
++            header =true;
++            break;
++        }
++        }
++        if (!header)
++            goto out;
++
++        int num = getNum(line);
++        int count = 0;
++        while(count < num) {
++            count += loadInstance(dump, PTRLOAD);
++        }
++    }
++out:
++    dump.close();
++  }
++
++
++int KDFIInstrument::loadInstance(std::ifstream& dump, IType ity) {
++    std::string line, line2;
++    std::string fname;
++    Function* func;
++    Value *src;
++    Value *dest;
++    int code;
++    int count = 0;
++
++    std::getline(dump, line);
++
++    fname = getFuncName(line);
++    func = getFunction(fname);
++    if (!func) {
++      while(line.compare("")) {
++        std::getline(dump, line);
++        if (line.compare("") && ity==PCOPY)
++          std::getline(dump, line);
++        ++count;
++      }
++      --count;
++      return count;
++    }
++    if (func->isDeclaration() || func->isIntrinsic() || !func->hasName()) {
++      while(line.compare("")) {
++        std::getline(dump, line);
++        if (line.compare("") && ity==PCOPY)
++          std::getline(dump, line);
++        ++count;
++      }
++      --count;
++      return count;
++    }
++    if (skip_funcs.count(fname) || wrong_funcs.count(fname)) {
++
++        while (line.compare("")) {
++            std::getline(dump, line);
++            if (line.compare("") && ity==PCOPY)
++              std::getline(dump, line);
++            ++count;
++        }
++        --count;
++        return count;
++    }
++    if (std::distance(inst_begin(func), inst_end(func)) == 1) {
++      wrong_funcs.insert(func->getName().str());
++      while(line.compare("")) {
++        std::getline(dump, line);
++        if (line.compare("") && ity==PCOPY)
++          std::getline(dump, line);
++        ++count;
++      }
++      --count;
++      return count;
++    }
++
++    std::getline(dump, line);
++    if (line.compare("") && ity==PCOPY)
++      std::getline(dump, line2);
++   
++    while (line.compare("")) {
++        src = getValue(func, line);
++        if (!src) {
++            print_error(line, func, "no src");
++            ++count;
++            std::getline(dump, line);
++            if (line.compare("") && ity==PCOPY)
++              std::getline(dump, line2);
++            continue;
++        }
++        Instruction *srcI = cast<Instruction>(src);
++        switch (ity) {
++            case PALLOCA:
++              mte_alloca.insert(srcI);
++              break;
++            case PTRCMP:
++              ptr_cmp.insert(srcI);
++              break;
++            case PTELOAD:
++              pte_inst.insert(srcI);
++              break;
++            case PTRLOAD:
++              ptr_inst.insert(srcI);
++              break;
++            case SAFE:
++              inter_safe_access.insert(srcI);
++              break;
++            case UNSAFE:
++              inter_unsafe_access.insert(srcI);
++              if (dumpset.count(srcI->getFunction())) {
++                print_debug(srcI, nullptr, "unsafe");
++              }
++              break;
++            case PCOPY:
++              pptr_copy.insert({srcI, getIndices(line2)});
++              break; 
++
++            default:
++                break;
++        }
++        ++count;
++        std::getline(dump, line);
++        if (line.compare("") && ity==PCOPY)
++          std::getline(dump, line2);
++    }
++
++    return count;
++}
++
++  std::string KDFIInstrument::strip_md(std::string str) {
++    std::string res = str;
++    std::smatch sm;
++
++    // strip metadata
++    std::size_t mdpos = res.find(", !");
++    while (mdpos != std::string::npos) {
++      res = res.substr(0, mdpos);
++      mdpos = res.find(", !");
++    }
++    std::regex e0 (".*(#[0-9]+)");
++    std::regex_match(res, sm, e0);
++    if (sm.size() == 2) {
++      res.erase(sm.position(1), sm.length(1));
++    }
++
++    // strip struct number
++    std::regex e1 (".*%(struct|union).[A-Za-z_]+(.[0-9]+).*");
++
++    while(true) {
++      std::regex_match(res, sm, e1);
++      if (sm.size() == 3) {
++        res.erase(sm.position(2), sm.length(2));
++      } else {
++        break;
++      }
++    }
++
++    e1 = ".*@.str(.[0-9]+).*";
++    while(true) {
++      std::regex_match(res, sm, e1);
++      if (sm.size() == 2) {
++        res.erase(sm.position(1), sm.length(1));
++      } else {
++        break;
++      }
++
++    }
++
++    mdpos = res.find("%struct.__kernel_");
++    while (mdpos != std::string::npos) {
++      res = res.replace(mdpos, 17, "%struct.");
++      mdpos = res.find("%struct.__kernel_");
++    }
++    return res;
++  }
++
++  std::string KDFIInstrument::strip_align(std::string str) {
++    std::regex e0 (".*(align [0-9]+)");
++    std::string res = str;
++    while (true) {
++      std::smatch sm;
++      std::regex_match(res, sm, e0);
++      if (sm.size() == 2) {
++        res.erase(sm.position(1), sm.length(1));
++      } else {
++        break;
++      }
++    }
++    return res;
++  }
++
++  std::string KDFIInstrument::strip_struct(std::string str) {
++    std::regex e(".*(%[struct|union]+.[A-Za-z_]+).*");
++    std::string res = str;
++    while(true) {
++      std::smatch sm;
++      std::regex_match(res, sm, e);
++      if (sm.size() == 2) {
++        res.replace(sm.position(1), sm.length(1), "");
++      }
++      else
++        break;
++    }
++    return res;
++  }
++
++  std::string KDFIInstrument::strip_arg(std::string str) {
++    std::regex e (".*(\%[0-9]+).*");
++    std::string res = str;
++    while (true) {
++      std::smatch sm;
++      std::regex_match(res, sm, e);
++      if (sm.size() == 2) {
++        res.replace(sm.position(1), sm.length(1), "");
++      } else
++        break;
++    }
++    return res;
++  }
++
++  std::string KDFIInstrument::strip_bitcast(std::string str) {
++    std::smatch sm;
++    std::regex ex ("(.*)(bitcast \\(.*)(@[0-9A-Za-z_.\\(\\)\\*]+)( to.*\\*\\))(.*)");
++
++    std::regex_match(str, sm, ex);
++
++    if (sm.size() == 6) {
++      std::string new_str = sm[1];
++      new_str.append(sm[3]);
++      std::smatch sm2;
++
++      std::string dest = sm.str(4);
++      int dest_idx = 0;
++      int prev_idx = 0;
++        std::regex ex2 ("( to [%0-9A-Za-z_.()* ]+\\*\\))");
++        std::regex_search(dest, sm2, ex2);
++        if (sm2.size() != 0) {
++            new_str.append(sm.str(4).substr(sm2.position(1)+sm2.length(1)));
++        }
++      new_str.append(sm[5]);
++      return new_str;
++    }
++    return str;
++  }
++
++  std::string KDFIInstrument::get_op(std::string str) {
++    std::regex e ("  (\%[0-9]+ = )?([a-z]+) .*");
++    std::smatch sm;
++    std::regex_match(str, sm, e);
++    if (sm.size() == 3) {
++      return str.substr(sm.position(2), sm.length(2));
++    } else {
++      return "";
++    }
++  }
++  bool KDFIInstrument::is_same(Value *v, std::string str, bool align) {
++    std::string istr = str;
++    std::string vstr;
++    llvm::raw_string_ostream rso(vstr);
++    v->print(rso);
++
++    bool debug = false;
++    if (auto i = dyn_cast<Instruction>(v))
++      debug = dumpset.count(i->getFunction()) > 0;
++    if (debug) {
++        errs() << "istr: " << istr <<"\n";
++        errs() << "vstr: " << vstr << "\n";
++    }
++
++
++    if (istr.compare(vstr) == 0)
++      return true;
++
++    std::string istr_s = strip_md(istr);
++    std::string vstr_s = strip_md(vstr);
++
++    if (debug) {
++        errs() << "istr_s: " << istr_s <<"\n";
++        errs() << "vstr_s: " << vstr_s << "\n";
++    }
++
++  if (align) {
++    istr_s = strip_align(istr_s);
++      vstr_s = strip_align(vstr_s);
++    }
++
++    if (istr_s.compare(vstr_s) == 0)
++      return true;
++
++    if (isa<Instruction>(v)) { // || isa<ConstantExpr>(v)){
++        std::string iop = get_op(istr);
++        std::string vop = get_op(vstr);
++        if (iop == "" || vop == "")
++          return false;
++        if (iop.compare(vop) != 0) {
++            return false;
++        }
++        if (iop.compare("bitcast") == 0 ||
++            iop.compare("getelementptr") == 0)
++          return true;
++    }
++
++    std::string strip_bc = strip_bitcast(istr_s);
++    if (debug)
++        errs() << "stbc: " << strip_bc << "\n";
++    if (strip_bc.compare(vstr_s) == 0)
++      return true;
++    if (debug)
++        errs() << "sbc2: " << strip_bitcast(strip_bc) << "\n";
++
++
++    // compare with arguments stripped
++    std::string istr_sarg = strip_arg(istr_s);
++    std::string vstr_sarg = strip_arg(vstr_s);
++    //errs() << "arg strip istr: " << istr_s << "\n";
++    //errs() << "arg strip vstr: " << vstr_s << "\n";
++    if (istr_sarg.compare(vstr_sarg) == 0)
++      return true;
++
++
++    // ignore union.anon mismatch
++    std::string istr_sstr = strip_struct(istr_s);
++    std::string vstr_sstr = strip_struct(vstr_s);
++    if (istr_sstr.compare(vstr_sstr) == 0)
++      return true;
++
++    istr = istr_sarg;
++    vstr = vstr_sarg;
++
++    auto iiter = istr.begin();
++    auto viter = vstr.begin();
++    int icnt = 0;
++    int vcnt = 0;
++    while(iiter != istr.end() && viter != vstr.begin()) {
++      if (*iiter != *viter)
++        break;
++      ++iiter;
++      ++viter;
++      ++icnt;
++      ++vcnt;
++    }
++
++    if (iiter != istr.end()) {
++      if (istr.substr(icnt+1, istr.size()-icnt-1).compare(vstr) == 0)
++        return true;
++    }
++    if (viter != vstr.end()) {
++      if (vstr.substr(vcnt+1, vstr.size()-vcnt-1).compare(istr) == 0)
++        return true;
++      }
++
++    if (iiter != istr.end() && viter != vstr.end()) {
++      if (istr.substr(icnt+1, istr.size()-icnt-1).compare(
++            vstr.substr(vcnt+1, vstr.size()-vcnt-1)) == 0)
++        return true;
++    }
++    if (auto li = dyn_cast<LoadInst>(v)) {
++        if (li->getFunction()->getName() == "__arm64_sys_kill")
++            return true;
++    }
++
++
++    if (isa<CallInst>(v)){
++      std::regex e("@([^.]+)\.([0-9]+)\\(");
++      std::smatch m;
++      if (std::regex_search(istr_s, m, e)) {
++        if (m.size() == 3) {
++         istr_s = std::regex_replace(istr_s, e, "@$1(");
++          errs() << istr_s << "\n";
++          if (istr_s.compare(vstr_s)==0)
++            return true;
++        }
++      }
++    }
++
++    return false;
++  }
++  bool KDFIInstrument::is_list_type(Type* ty) {
++    if (!isa<StructType>(ty) &&  !isa<PointerType>(ty))
++      return false;
++    if (isa<PointerType>(ty)) {
++        if (!isa<StructType>(ty->getPointerElementType()))
++            return false;
++        if (!list_structs.count(
++                get_struct_name(
++                    cast<StructType>(ty->getPointerElementType())->getName().str())))
++            return false;
++        return true;
++    }
++    if (!list_structs.count(
++            get_struct_name(cast<StructType>(ty)->getName().str())))
++        return false;
++    return true;
++  }
++  StructType *KDFIInstrument::get_list_type(Type* ty) {
++    if (!isa<StructType>(ty) &&  !isa<PointerType>(ty))
++      return nullptr;
++    if (isa<PointerType>(ty)) {
++        if (!isa<StructType>(ty->getPointerElementType()))
++            return nullptr;
++        if (list_structs.count(
++                get_struct_name(
++                    cast<StructType>(ty->getPointerElementType())->getName().str())))
++            return get_pstr_type(ty);
++        return nullptr;
++    }
++    if (list_structs.count(
++            get_struct_name(cast<StructType>(ty)->getName().str())))
++        return cast<StructType>(ty);
++    return nullptr;
++  }
++
++  bool KDFIInstrument::is_alloc_func(std::string fname) {
++    if (alloc_funcs.count(fname)>0)
++      return true;
++    else
++      return false;
++  }
++  bool KDFIInstrument::is_alloc_inst(Value *v) {
++    if (isa<CastInst>(v))
++        return is_alloc_inst(cast<User>(v)->getOperand(0));
++    if (!isa<CallInst>(v))
++      return false;
++    if (is_alloc_func(get_callee_function_name(cast<Instruction>(v)).str()))
++        return true;
++    return false;
++  }
++  StructType *KDFIInstrument::get_cast_pstr_type(Value *v) {
++    if (auto sty = get_pstr_type(v))
++      return sty;
++    if (auto li = dyn_cast<LoadInst>(v)) {
++      if (auto ci = dyn_cast<CastInst>(li->getOperand(0))) {
++        if (!is_err_ptr(ci)) {
++          if (auto pty = dyn_cast<PointerType>(ci->getOperand(0)->getType())) {
++            if (auto sty = get_pstr_type(pty->getElementType()))
++              return sty;
++          }
++          if (is_list_type(ci->getOperand(0)->getType()))
++            return cast<StructType>(ci->getOperand(0)->getType());
++        }
++      }
++    } else if (is_asm_load(v)) {
++      Value *src = cast<CallBase>(v)->getArgOperand(get_asm_addr(v));
++      if (auto pty = dyn_cast<PointerType>(src->getType())) {
++        if (auto ety = pty->getPointerElementType()) {
++          if (auto sty = get_pstr_type(ety)) {
++            return sty;
++          }
++        }
++      }
++    }
++    for (auto u : v->users()) {
++      if (isa<CastInst>(u) && !is_err_ptr(u))
++        if (auto sty = get_pstr_type(u)) {
++          if (!sty->getName().startswith("struct.anon") &&
++              !sty->getName().startswith("union.anon"))
++            return sty;
++        }
++    }
++    return nullptr;
++  }
++
++  bool KDFIInstrument::is_kdfi_skip_func(std::string fname) {
++    if (fname.find("llvm.") == 0)
++      return true;
++    if (fname.compare("ppac_create") == 0)
++        return true;
++    if (fname.find("fdt")==0)
++      return true;
++    for (auto sname : kdfi_skip_funcs) {
++      if (fname.compare(sname) == 0)
++        return true;
++      if (fname.find(sname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(fname, sm, e);
++        if (sm.size() == 2) {
++          if (fname.substr(0, sm.position(1)-2).compare(sname) == 0)
++            return true;
++        }
++      } else if (sname.find(fname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(sname, sm, e);
++        if (sm.size() == 2) {
++          if (sname.substr(0, sm.position(1)-2).compare(fname) == 0)
++            return true;
++        }
++      }
++    }
++    return false;
++  }
++
++  bool KDFIInstrument::is_ptag_skip_func(std::string fname) {
++    for (auto sname : ptag_skip_funcs) {
++      if (fname.compare(sname) == 0)
++        return true;
++      if (fname.find(sname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(fname, sm, e);
++        if (sm.size() == 2) {
++          if (fname.substr(0, sm.position(1)-2).compare(sname) == 0)
++            return true;
++        }
++      } else if (sname.find(fname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(sname, sm, e);
++        if (sm.size() == 2) {
++          if (sname.substr(0, sm.position(1)-2).compare(fname) == 0)
++            return true;
++        }
++      }
++    }
++    return false;
++  }
++  bool KDFIInstrument::is_mte_skip_func(std::string fname) {
++    for (auto sname : mte_skip_funcs) {
++      if (fname.compare(sname) == 0)
++        return true;
++      if (fname.find(sname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(fname, sm, e);
++        if (sm.size() == 2) {
++          if (fname.substr(0, sm.position(1)-2).compare(sname) == 0)
++            return true;
++        }
++      } else if (sname.find(fname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(sname, sm, e);
++        if (sm.size() == 2) {
++          if (sname.substr(0, sm.position(1)-2).compare(fname) == 0)
++            return true;
++        }
++      }
++    }
++    return false;
++  }
++  bool KDFIInstrument::is_pac_skip_func(std::string fname) {
++    for (auto sname : pac_skip_funcs) {
++      if (fname.compare(sname) == 0)
++        return true;
++      if (fname.find(sname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(fname, sm, e);
++        if (sm.size() == 2) {
++          if (fname.substr(0, sm.position(1)-2).compare(sname) == 0)
++            return true;
++        }
++      } else if (sname.find(fname) != std::string::npos) {
++        std::regex e(".*(\.[0-9]+)");
++        std::smatch sm;
++        std::regex_match(sname, sm, e);
++        if (sm.size() == 2) {
++          if (sname.substr(0, sm.position(1)-2).compare(fname) == 0)
++            return true;
++        }
++      }
++    }
++    return false;
++  }
++  Function *KDFIInstrument::get_kdfi_skip_func(std::string fname) {
++    Function *func = getFunction(fname);
++
++    if (!func) {
++      std::regex e(".*(\.[0-9]+)");
++      std::smatch sm;
++      std::regex_match(fname, sm, e);
++      if (sm.size() == 2) {
++        func = M->getFunction(fname.substr(0, sm.position(1)-2));
++      }
++    }
++    return func;
++  }
++  std::string KDFIInstrument::getFuncName(std::string line) {
++    std::string res = line;
++    if (line.find("func    ") != std::string::npos)
++        res = res.substr(10);
++    auto pos = res.find(".");
++    while (pos != std::string::npos) {
++      res = res.substr(0, pos);
++      pos = res.find(".");
++    }
++    return res;
++  }
++
++  int KDFIInstrument::getNum(std::string line) {
++    std::string num_str = std::regex_replace(
++      line,
++      std::regex("[^0-9]*([0-9]+).*"),
++      std::string("$1")
++    );
++    return std::stoi(num_str);
++  }
++
++  Indices *KDFIInstrument::getIndices(std::string line) {
++    Indices idx;
++    char *nstr = strtok(&line[0], " ");
++
++    while(nstr != NULL) {
++      idx.push_back(std::stoi(nstr));
++      nstr = strtok(NULL, " ");
++    }
++    return new Indices(idx);
++  }
++
++  int KDFIInstrument::getOpNum(std::string prev, std::string line) {
++    if (prev == "" || line == "")
++      return -1;
++    std::string istr = line;
++    std::size_t start = istr.find(": ");
++    istr = istr.substr(start+2);
++
++    std::string op = get_op(istr);
++    if (op.find("load") != std::string::npos)
++      return 0;
++
++    // TODO: call
++    if (op.find("store") != std::string::npos)
++      return -1;
++
++    // store i64 %xx, i64* %yy
++    // get previous name
++    std::regex e (".*(\%[0-9]+) = .*");
++    std::smatch sm;
++    std::regex_match(prev, sm, e);
++    if (sm.size() != 2)
++      return -1;
++
++    std::string pstr = sm[1];
++
++    auto pos = istr.find(pstr);
++    if (pos == std::string::npos)
++      return -1;
++
++    auto delim = istr.find(",");
++    if (delim == std::string::npos)
++      return -1;
++    if (pos < delim)
++      return 0;
++    else
++      return 1;
++  }
++
++  VType KDFIInstrument::getType(std::string line) {
++    std::size_t open_idx = line.find("[");
++    std::size_t close_idx = line.find("]");
++    assert((open_idx != std::string::npos) && (close_idx != std::npos));
++    assert(close_idx == open_idx+2);
++    VType vty = VTYPE_U;
++    switch(line[open_idx+1]) {
++      case 'i':
++        vty = VTYPE_I;
++        break;
++      case 'c':
++        vty = VTYPE_C;
++        break;
++      case 'a':
++        vty = VTYPE_A;
++        break;
++      case 'g':
++        vty = VTYPE_G;
++        break;
++      case 'u':
++        vty = VTYPE_U;
++        break;
++      default:
++        break;
++    }
++    return vty;
++  }
++  Value *KDFIInstrument::getValue(Function *func, std::string line,
++                                  Value *prev, int prev_op,
++                                  unsigned opNum) {
++    std::size_t open_idx = line.find("[");
++    std::size_t close_idx = line.find("]");
++    assert((open_idx != std::string::npos) && (close_idx != std::npos));
++    assert(close_idx == open_idx+2);
++    VType vty = VTYPE_U;
++    switch(line[open_idx+1]) {
++      case 'i':
++        vty = VTYPE_I;
++        break;
++      case 'c':
++        vty = VTYPE_C;
++        break;
++      case 'a':
++        vty = VTYPE_A;
++        break;
++      case 'g':
++        vty = VTYPE_G;
++        break;
++      case 'u':
++        vty = VTYPE_U;
++        break;
++      default:
++        break;
++    }
++    if (vty == VTYPE_U) {
++      print_error(line, func, "unknown vtype");
++      return nullptr;
++    }
++
++    std::size_t start = line.find(": ");
++    assert(start != std::string::npos);
++
++    if (vty == VTYPE_I)
++      return getInst(func, line, prev, prev_op, opNum);
++    else if (vty == VTYPE_C)
++      return getCE(func, line.substr(start+2));
++    else if (vty == VTYPE_A)
++      return getArg(func, line.substr(start+2));
++    else { // VTYPE_G
++      return getGV(func, line.substr(start+2));
++    }
++  }
++
++#define WINDOW 3
++  Instruction *KDFIInstrument::getInst(Function *func, std::string str,
++                                       Value *prev, int prev_op,
++                                       unsigned opNum) {
++    std::string istr = str;
++    std::size_t open_idx = istr.find("[");
++    std::size_t close_idx = istr.find("]");
++    assert((open_idx != std::string::npos) && (close_idx != std::npos));
++    assert(close_idx > open_idx+2);
++    assert(istr[open_idx+1] == "i");
++
++    // get inst num
++    std::smatch sm;
++    std::string nstr = istr.substr(open_idx+2, close_idx-open_idx-2);
++    std::regex e3 ("([0-9]+)-([0-9]+)-([0-9]+)");
++    std::regex_match(nstr, sm, e3);
++    if (sm.size() != 4)
++      return nullptr;
++
++    int inum = std::stoi(nstr.substr(sm.position(1), sm.length(1)));
++    int op = std::stoi(nstr.substr(sm.position(2), sm.length(2)));
++    int opcnt = std::stoi(nstr.substr(sm.position(3), sm.length(3)));
++
++    bool debug = dumpset.count(func)>0;
++    std::size_t start;
++    int count;
++    auto iter = inst_begin(func);
++    int fsize = std::distance(inst_begin(func), inst_end(func));
++
++    if (func->getName() == "init_udp_sock" || func->getName().startswith("tcp_"))
++      inum = -1;
++
++    if (inum > fsize) {
++      //skip_funcs.insert(func->getName().str());
++      goto out;
++    }
++
++    start = istr.find(": ");
++    assert(start != std::string::npos);
++    istr = istr.substr(start+2);
++
++    count = 0;
++    for (; iter != inst_end(func); ++iter) {
++        if (isa<DbgInfoIntrinsic>(&*iter))
++            continue;
++        if (isa<CallInst>(&*iter)) {
++          auto fname = get_callee_function_name(&*iter);
++          if (fname.startswith("llvm.dbg.value"))
++            continue;
++        }
++        if (count == inum)
++            break;
++        count++;
++    }
++    if (iter == inst_end(func)) {
++        goto retry;
++    }
++    if (iter->getOpcode() == op) {
++      if (is_same(&*iter, istr))
++        return &*iter;
++      if (func->getName() == "task_list_init" || func->getName() == "init_smack_known_list")
++        return &*iter;
++    }
++
++retry:
++    if (debug) {
++        print_debug(istr);
++        errs() << "op:  " << opNum << "\n";
++    }
++    iter = inst_begin(func);
++    count = 0;
++    for (; iter != inst_end(func); ++iter) {
++      if (isa<DbgInfoIntrinsic>(&*iter))
++        continue;
++      if (isa<CallInst>(&*iter)) {
++          auto fname = get_callee_function_name(&*iter);
++          if (fname.startswith("llvm.dbg.value"))
++            continue;
++        }
++      if (iter->getOpcode() == op  && opNum < (iter->getNumOperands())) {
++        if (count == opcnt) {
++          if (func->getName().startswith("tcp_"))
++            return &*iter;
++          if (is_same(&*iter, istr, true))
++            return &*iter;
++          else
++              break;
++        } else {
++          count++;
++        }
++      }
++    }
++    // has previous use
++    if (prev && prev_op>=0) {
++      for (auto u : prev->users()) {
++        if (auto ii = dyn_cast<Instruction>(u)) {
++          if (ii->getFunction() != func)
++            continue;
++          if (ii->getOpcode() != op)
++            continue;
++          if (ii->getOperand(prev_op) == prev)
++            return ii;
++        }
++      }
++    }
++
++
++    if (op == Instruction::Call) {
++        // get function name
++        // TODO: regex
++        std::regex e ("@([A-Za-z_]+)");
++        std::smatch sm;
++        std::regex_search(str, sm, e);
++        if (sm.size() <= 1) {
++            goto out;
++        }
++        std::string cstr = sm[1];
++        std::string fname = getFuncName(cstr);
++
++        InstIntSet iiset;
++        int count = 0;
++        for (iter = inst_begin(func); iter != inst_end(func); ++iter) {
++            if (isa<DbgInfoIntrinsic>(&*iter))
++                continue;
++            if (auto ci = dyn_cast<CallInst>(&*iter)) {
++                Function *ff = ci->getCalledFunction();
++                if (ff) {
++                    if (ff->hasName()){
++                        if (ff->getName().compare(fname) == 0) {
++                            iiset.insert(new InstInt(std::make_pair(ci, count)));
++                        }
++                    }
++                }
++                count++;
++            }
++        }
++
++        if (iiset.size() == 1) {
++            return (*iiset.begin())->first;
++        } else {
++            // multiple callinst calling same function!
++            int min=1000;
++            Instruction *res = nullptr;
++            for (auto ii : iiset) {
++                int dist = (inum > ii->second) ? inum - ii->second : ii->second - inum;
++                if (dist < min) {
++                    min = dist;
++                    res = ii->first;
++                }
++            }
++            return res;
++        }
++    }
++
++    out:
++        return nullptr;
++
++  }
++
++  Value *KDFIInstrument::getCE(Function *func, std::string str) {
++    std::string strip_bc = strip_bitcast(str);
++    if (strip_bc.find("\(") == std::string::npos) {
++        if (strip_bc.find("\@") != std::string::npos) {
++          auto start = strip_bc.find("\@");
++          return getGV(func, strip_bc.substr(start+1));
++        }
++    }
++
++    for (auto &B : *func) {
++      for (auto I = B.begin(), E = B.end(); I != E; ++I) {
++
++        ValueList worklist;
++        ValueSet visited;
++        for (int i=0; i<I->getNumOperands(); ++i) {
++          if (isa<ConstantExpr>(I->getOperand(i))) {
++            worklist.push_back(I->getOperand(i));
++          }
++        }
++
++        while(worklist.size()) {
++          Value *v = worklist.front();
++          worklist.pop_front();
++          if (visited.count(v))
++            continue;
++          visited.insert(v);
++          if (!isa<ConstantExpr>(v))
++            continue;
++          if (is_same(v, str)) {
++            return v;
++          }
++
++          for (int i=0; i<cast<User>(v)->getNumOperands(); ++i) {
++            worklist.push_back(cast<User>(v)->getOperand(i));
++          }
++        }
++      }
++    }
++    return nullptr;
++  }
++
++  Argument *KDFIInstrument::getArg(Function *func, std::string str) {
++    std::string num_str = std::regex_replace(
++      str,
++      std::regex(".*%([0-9]+)"),
++      std::string("$1")
++    );
++    int argno = std::stoi(num_str);
++    return func->getArg(argno);
++  }
++
++  GlobalVariable *KDFIInstrument::getGV(Function *func, std::string str) {
++    return M->getGlobalVariable(str);
++  }
++
++  Function *KDFIInstrument::getFunction(std::string fname){
++    Function* func = nullptr;
++    if (fmap.count(fname)) {
++      return fmap[fname];
++    }
++    func = M->getFunction(fname);
++    if (func)
++      goto end;
++    for (Module::iterator fi = M->begin(), fe = M->end(); fi != fe; ++fi) {
++      Function *f = dyn_cast<Function>(fi);
++      if (!f)
++        continue;
++      if (f->isDeclaration() || f->isIntrinsic() || (!f->hasName()))
++        continue;
++      auto ffname = getFuncName(f->getName().str());
++      if (ffname.compare(fname) == 0) {
++        func = f;
++        goto end;
++      }
++
++    }
++end:
++    fmap[fname] = func;
++    return func;
++  }
++
++  bool is_pte_type(Type *ty) {
++    if (!isa<StructType>(ty))
++      return false;
++    auto sty = cast<StructType>(ty);
++    if (sty->getName()=="struct.pte_t" ||
++        sty->getName()=="struct.pmd_t" ||
++        sty->getName()=="struct.pud_t" ||
++        sty->getName()=="struct.pgd_t" ||
++        sty->getName()=="struct.alt_instr" ||
++        sty->getName().startswith("struct.page"))
++      return true;
++
++    return false;
++  }
++
++  void KDFIInstrument::collect(Value *v, unsigned target_opcode, unsigned target_opnum,
++                               std::set<unsigned> *skip_opcodes, ValueSet *results,
++                               UseSet *visited) {
++    UseSet _visited;
++    UseList worklist;
++    bool debug = false;
++    if (auto ii = dyn_cast<Instruction>(v)) {
++      if (dumpset.count(ii->getFunction())) {
++        debug=true;
++        print_debug(v, "collect");
++      }
++    }
++    if (!visited)
++      visited = &_visited;
++
++    for (auto &u : v->uses())
++      worklist.push_back(&u);
++
++    while(worklist.size()) {
++      auto u = worklist.back();
++      auto op = u->getOperandNo();
++      auto vv = u->getUser();
++      worklist.pop_back();
++
++      if (visited->count(u))
++        continue;
++      visited->insert(u);
++
++
++      if (debug)
++        print_debug(vv, "collect-vv");
++
++      if (isa<Argument>(vv)) {
++        for (auto &u : vv->uses())
++          worklist.push_back(&u);
++        continue;
++      }
++      if (!isa<Instruction>(vv))
++        continue;
++      if (isa<TruncInst>(vv)) {
++        if (is_err_ptr(vv))
++          continue;
++      }
++      auto i = cast<Instruction>(vv);
++      if (i->getOpcode() == target_opcode) {
++        if (target_opnum < 0 || op == target_opnum) {
++          results->insert(vv);
++          continue;
++        }
++      }
++      if (skip_opcodes && !is_asm(i))
++        if (skip_opcodes->count(i->getOpcode()))
++          continue;
++      switch(i->getOpcode()) {
++      case Instruction::Call:
++        if (is_asm(i)) {
++          int addr_op = get_asm_addr(i);
++          if (op<0 || addr_op != op) {
++            continue;
++          }
++          if (isa<IntegerType>(u->get()->getType()) &&
++              u->get()->getType()->getPrimitiveSizeInBits() < 64) {
++            continue;
++          }
++          if (target_opcode==Instruction::Load && is_asm_load(i)) {
++            results->insert(i);
++          } else if (target_opcode==Instruction::Store && is_asm_store(i)) {
++              results->insert(i);
++          }
++        } else if (is_builtin_container_of(i)) {
++          if (skip_opcodes && skip_opcodes->count(Instruction::GetElementPtr))
++            continue;
++          for (auto &uu : i->uses())
++            worklist.push_back(&uu);
++        } else if (is_alloc_inst(i)) {
++          continue;
++        } else if (auto callee=get_callee_function_direct(i)) {
++          if (is_alloc_func(callee->getName().str()))
++            continue;
++          if (op >= callee->arg_size())
++            continue;
++          auto arg = callee->getArg(op);
++          for(auto &uu : arg->uses()) {
++            worklist.push_back(&uu);
++          }
++        }
++        break;
++      case Instruction::Select:
++        if (op==1 || op==2) {
++          for (auto &uu : i->uses())
++            worklist.push_back(&uu);
++        }
++        break;
++      case Instruction::PHI:
++      case Instruction::GetElementPtr:
++      case Instruction::BitCast:
++      case Instruction::IntToPtr:
++      case Instruction::PtrToInt:
++      case Instruction::ZExt:
++      case Instruction::Trunc:
++      case Instruction::SExt:
++      case Instruction::And:
++      case Instruction::Or:
++      case Instruction::Add:
++      case Instruction::Sub:
++      case Instruction::Xor:
++      case Instruction::Mul:
++      case Instruction::LShr:
++      case Instruction::Shl:
++      case Instruction::ExtractValue:
++      case Instruction::InsertValue:
++        for (auto &uu : i->uses()) {
++          worklist.push_back(&uu);
++        }
++        break;
++
++      case Instruction::Ret:
++        for (auto u : i->getFunction()->users()) {
++          if (auto ci = dyn_cast<CallInst>(u)) {
++            if (is_alloc_func(ci->getFunction()->getName().str()))
++              continue;
++            for (auto &_u : ci->uses()) {
++              worklist.push_back(&_u);
++            }
++          }
++        }
++        break;
++
++      default:
++        break;
++      }
++    }
++  }
++
++  void KDFIInstrument::collect_alloc(Module &M) {
++    for (Module::iterator fi = M.begin(), fe = M.end();
++         fi != fe; ++fi) {
++      Function *func = dyn_cast<Function>(fi);
++      if (!func)
++        continue;
++      if (func->isDeclaration() || func->isIntrinsic() || (!func->hasName()))
++        continue;
++      if (is_alloc_func(func->getName().str()))
++        continue;
++
++      for (auto &B : *func) {
++        for (auto I = B.begin(), E = B.end(); I != E; ++I) {
++          if (!isa<CallInst>(&*I))
++            continue;
++          if (!is_alloc_func(get_callee_function_name(&*I).str()))
++            continue;
++          if (normal_alloc.count(&*I))
++            continue;
++          if (mte_alloc.count(&*I))
++            continue;
++          allocset.insert(&*I);
++        }
++      }
++    }
++  }
++
++  void KDFIInstrument::collect_gref(Module &M) {
++    for (Module::iterator fi = M.begin(), fe = M.end();
++         fi != fe; ++fi) {
++      Function *func = dyn_cast<Function>(fi);
++      if (!func)
++        continue;
++      if (func->isDeclaration() || func->isIntrinsic() || (!func->hasName()))
++        continue;
++      if (is_alloc_func(func->getName().str()))
++        continue;
++
++      for(auto &B : *func) {
++        for (auto I = B.begin(), E = B.end(); I != E; ++I) {
++          if (isa<LoadInst>(&*I))
++            continue;
++          else if (isa<StoreInst>(&*I)) {
++            if (is_global(I->getOperand(0), &gpobj))
++              gref.insert(&*I);
++            continue;
++          } else if (auto ci = dyn_cast<CallInst>(&*I)) {
++            if (is_builtin_container_of(ci) || is_asm(ci) || is_alloc_inst(ci))
++              continue;
++            auto f = ci->getCalledFunction();
++            if (f) {
++              for (int i=0; i<ci->arg_size() && i<f->arg_size(); ++i) {
++                if (is_global(ci->getArgOperand(i), &gpobj)) {
++                  gref.insert(f->getArg(i));
++                  safe_ptr.insert(f->getArg(i));
++                  tagged_ptr.insert(f->getArg(i));
++                }
++              }
++            }
++            continue;
++          }
++
++          for (auto &u : I->operands()) {
++            if (is_global(u.get(), &gpobj)) {
++              gref.insert(&*I);
++              safe_ptr.insert(&*I);
++              tagged_ptr.insert(&*I);
++            }
++          }
++        }
++      }
++    }
++  }
++
++  void KDFIInstrument::collect_ptr(Module &M) {
++    for (auto i : mte_alloc) {
++      safe_ptr.insert(i.first);
++    }
++    for (auto i : mte_alloca) {
++      safe_ptr.insert(i);
++    }
++    for (Module::iterator fi = M.begin(), fe = M.end();
++         fi != fe; ++fi) {
++      Function *func = dyn_cast<Function>(fi);
++      if (!func)
++        continue;
++      if (func->isDeclaration() || func->isIntrinsic() || (!func->hasName()))
++        continue;
++      if (is_alloc_func(func->getName().str()))
++        continue;
++      if (mte_skip_funcs.count(func->getName().str()))
++        continue;
++
++      for (auto &arg : func->args()) {
++        if (auto sty = get_cast_pstr_type(&arg)) {
++          if (is_pobj(sty) ||
++              is_nested_pobj(sty)) {
++            safe_ptr.insert(&arg);
++            tagged_ptr.insert(&arg);
++          } else if (is_pte_type(sty) ||
++                     is_list_type(sty)) {
++            safe_ptr.insert(&arg);
++          } else {
++            unsafe_ptr.insert(&arg);
++          }
++        }
++      }
++
++      for (auto &B : *func) {
++        for (auto I = B.begin(), E = B.end(); I != E; ++I) {
++          if (isa<LoadInst>(&*I)) {
++            if (isa<IntegerType>(I->getType()) &&
++                I->getType()->getPrimitiveSizeInBits()<64)
++              continue;
++
++            bool is_safe_ptr=false;
++            bool is_tagged_ptr=false;
++            bool is_unsafe_ptr=false;
++
++            if (auto sty = get_cast_pstr_type(&*I)) {
++              if (is_pobj(sty) ||
++                  is_nested_pobj(sty)) {
++                is_safe_ptr = true;
++                is_tagged_ptr = true;
++              } else if (is_list_type(sty) ||
++                  is_pte_type(sty)) {
++                is_safe_ptr = true;
++              } else {
++                is_unsafe_ptr = true;
++              }
++            }
++
++            if (is_global(I->getOperand(0), &gvref))
++              is_safe_ptr = true;
++
++            if (is_tagged_ptr)
++              tagged_ptr.insert(&*I);
++
++            if (is_safe_ptr)
++              safe_ptr.insert(&*I);
++            else if (is_unsafe_ptr)
++              unsafe_ptr.insert(&*I);
++
++          }
++          else if (is_asm(&*I)) {
++            if (is_asm_get_current(&*I)) {
++              safe_ptr.insert(&*I);
++              tagged_ptr.insert(&*I);
++            } else if (is_asm_load(&*I)) {
++              if (auto sty = get_cast_pstr_type(&*I)) {
++                if (is_pobj(sty) ||
++                  is_nested_pobj(sty)) {
++                  safe_ptr.insert(&*I);
++                  tagged_ptr.insert(&*I);
++                } else if (is_list_type(sty) ||
++                  is_pte_type(sty)) {
++                  safe_ptr.insert(&*I);
++                } else {
++                  unsafe_ptr.insert(&*I);
++                }
++              }
++            }
++          } else if (isa<GetElementPtrInst>(&*I)) {
++            if (auto sty = get_pstr_type(I->getOperand(0)->getType())) {
++              if (is_pobj(sty) || is_nested_pobj(sty)) {
++                safe_ptr.insert(I->getOperand(0));
++                tagged_ptr.insert(I->getOperand(0));
++              } else if (is_list_type(sty) || is_pte_type(sty))
++                safe_ptr.insert(I->getOperand(0));
++            }
++            if (!isa<PointerType>(I->getType()))
++              continue;
++
++            auto sty = get_pstr_type(I->getType()->getPointerElementType());
++            bool is_safe = true;
++            bool is_priv = false;
++            if (sty) {
++              if (is_pobj(sty) || is_nested_pobj(sty)) {
++                is_safe = true;
++                is_priv = true;
++              } else if (is_list_type(sty) || is_pte_type(sty)) {
++                is_safe = true;
++              } else
++                is_safe = false;
++            }
++
++            ValueSet ldset;
++            std::set<unsigned> skipset = {Instruction::GetElementPtr};
++            collect(&*I, Instruction::Load, 0, &skipset, &ldset);
++            for (auto ld : ldset) {
++              if (is_safe)
++                safe_ptr.insert(ld);
++              else
++                unsafe_ptr.insert(ld);
++
++              if (is_priv)
++                tagged_ptr.insert(ld);
++            }
++          } else if (isa<CallInst>(&*I)) {
++            if (auto sty = get_cast_pstr_type(&*I)) {
++              if (auto sty = get_cast_pstr_type(&*I)){
++                if (is_pobj(sty) ||
++                    is_nested_pobj(sty)) {
++                  safe_ptr.insert(&*I);
++                  tagged_ptr.insert(&*I);
++                } else if (is_list_type(sty) ||
++                           is_pte_type(sty)) {
++                  safe_ptr.insert(&*I);
++                } else {
++                  unsafe_ptr.insert(&*I);
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++
++    return;
++  }
++
++  void KDFIInstrument::collect_ptr_deref(Module &M) {
++
++    std::set<unsigned> emptyset = {};
++    std::set<unsigned> skipset = {Instruction::Call, Instruction::Ret};
++    ValueSet eraseset;
++
++    // inter-procedural
++    for (auto ld : safe_ptr) {
++      ValueSet ldset, strset;
++      collect(ld, Instruction::Load, 0, &emptyset, &ldset);
++      collect(ld, Instruction::Store, 1, &emptyset, &strset);
++      for (auto i : ldset)
++        safe_access.insert(i);
++      for (auto i : strset)
++        safe_access.insert(i);
++
++      if (tagged_ptr.count(ld)) {
++        for (auto i : ldset)
++          tagged_access.insert(i);
++        for (auto i : strset)
++          tagged_access.insert(i);
++      }
++    }
++
++    for (auto ld : unsafe_ptr) {
++      ValueSet ldset, strset, callset;
++      collect(ld, Instruction::Load, 0, &emptyset, &ldset);
++      collect(ld, Instruction::Store, 1, &emptyset, &strset);
++      for (auto i : ldset)
++        unsafe_access.insert(i);
++      for (auto i : strset)
++        unsafe_access.insert(i);
++    }
++
++    for (auto i : inter_unsafe_access)
++      unsafe_access.insert(i);
++
++    for (auto i : safe_access) {
++      if (unsafe_access.count(i))
++        unsafe_access.erase(i);
++    }
++
++    for (auto i : inter_safe_access) {
++      if (unsafe_access.count(i))
++        unsafe_access.erase(i);
++    }
++  }
++
++  bool KDFIInstrument::Run(Module &M) {
++
++    // Object protection
++    collect_gref(M);
++    collect_ptr(M);
++    collect_ptr_deref(M);
++
++    // Pointer protection
++    collect_pptr_ref(M);
++    collect_pptr_access(M);
++
++    // 16-byte align for every global variable
++    for (auto &gv : M.globals()) {
++      if (!gv.hasName())
++        continue;
++      auto gn = gv.getName();
++      if (gv.getAlignment() > 16)
++        continue;
++      if (gn.contains("__param"))
++        continue;
++      if (gn.startswith(".compound"))
++        continue;
++      if (gn.startswith("llvm.") ||
++          gn.startswith("_") ||
++          gn.startswith(".str") ||
++          gn.contains("kstack_offset") ||
++          gn.startswith("kimage") ||
++          gn.startswith("pcpu_base_addr") ||
++          //gn.startswith("__per_cpu") ||
++          //gn.startswith("__kstrtab") ||
++          //gn.startswith("_note_55") ||
++          //gn.startswith("__addressable") ||
++          gn.startswith("TRACE")
++          ) {
++        continue;
++      }
++
++      if (auto sty = get_pstr_type(gv.getType())) {
++        if (is_pte_type(sty))
++          continue;
++      }
++      gv.setAlignment(Align(16));
++    }
++
++    kdfi_instrumentation();
++    tag_globals(M);
++    sign_globals(M);
++
++    if (dumpset.size()) {
++      for (auto f : dumpset) {
++        errs() <<"after\n";
++        errs() << *f << "\n";
++        //errs() << M <<"\n";
++      }
++    }
++
++    return true;
++  }
++
++  void KDFIInstrument::collect_pptr_ref(Module &M) {
++
++    for (Module::iterator fi = M.begin(), fe = M.end();
++         fi != fe; ++fi) {
++      Function *func = dyn_cast<Function>(fi);
++      if (!func)
++        continue;
++      if (func->isDeclaration() || func->isIntrinsic() || (!func->hasName()))
++        continue;
++      if (is_alloc_func(func->getName().str()))
++        continue;
++      for (auto &arg : func->args()) {
++        if (auto sty = get_cast_pstr_type(&arg)) {
++          if (pptr_reftype.count(sty)) {
++            pptr_ref.insert(&arg);
++          }
++          if (is_skip_ptr(&arg))
++            skip_ref.insert(&arg);
++        }
++        if (isa<PointerType>(arg.getType())) {
++          if (auto sty = get_pstr_type(arg.getType()->getPointerElementType())) {
++            if (pobj.count(sty)) {
++              pptr_ref.insert(&arg);
++            }
++          }
++        }
++      }
++
++      for (auto &B : *func) {
++        for (auto I = B.begin(), E = B.end(); I != E; ++I) {
++          if (is_skip_ptr(&*I)) {
++            skip_ref.insert(&*I);
++          }
++          if (isa<AllocaInst>(&*I)) {
++            if (auto sty = get_pstr_type(I->getType()->getPointerElementType())) {
++              if (pobj.count(sty)) {
++                pptr_ref.insert(&*I);
++              }
++            }
++            if (auto sty = get_pstr_type(I->getType())) {
++              if (pptr_reftype.count(sty)) {
++                pptr_ref.insert(&*I);
++              }
++            }
++          }
++          else if (isa<BinaryOperator>(&*I)) {
++            // per_cpu ptr
++            std::set<unsigned> skipset = {/*Instruction::Add,*/ Instruction::Sub,
++                                  Instruction::Shl, Instruction::GetElementPtr};
++            if (I->getOpcode()==Instruction::Add) {
++              if (is_global(I->getOperand(1), &gpptr, &skipset)) {
++                pptr_ref.insert(&*I);
++              }
++
++              else if (auto ce = dyn_cast<ConstantExpr>(I->getOperand(1))) {
++                if (ce->getOpcode()==Instruction::PtrToInt) {
++                  auto ety = cast<PointerType>(ce->getOperand(0)->getType())->getPointerElementType();
++                  // ptrtoint (%struct.xxx**)
++                  if (auto sty = get_pstr_type(ety)) {
++                    if (pobj.count(sty))
++                      pptr_ref.insert(&*I);
++                  // ptrtoint ([n x %struct.xxx*]*)
++                  } else if (auto ty = get_parr_type(ce->getOperand(0)->getType())) {
++                    if (auto sty = get_pstr_type(ty)) {
++                      if (pobj.count(sty))
++                        pptr_ref.insert(&*I);
++                    }
++                  }
++                }
++              }
++            }
++          } else if (isa<IntToPtrInst>(&*I)) {
++            // per_cpu ptr
++            // inttoptr i64 to %struct.xxx**
++            if (auto sty = get_pstr_type(I->getType()->getPointerElementType())) {
++              if (auto b = dyn_cast<BinaryOperator>(I->getOperand(0))) {
++                if (b->getOpcode()==Instruction::Add) {
++                  if (pobj.count(sty)) {
++                    pptr_ref.insert(&*I);
++                  }
++                }
++              }
++            // inttoptr i64 to [n x %struct.xxx*]*
++            } else if (auto ty = get_parr_type(I->getType())) {
++              if (auto sty = get_pstr_type(ty)) {
++                if (auto b = dyn_cast<BinaryOperator>(I->getOperand(0))) {
++                  if (b->getOpcode()==Instruction::Add) {
++                    if (pobj.count(sty)) {
++                      pptr_ref.insert(&*I);
++                    }
++                  }
++                }
++              }
++            }
++          }
++          else if (isa<GetElementPtrInst>(&*I)) {
++            // struct * field
++            if (auto sty = get_pstr_type(I->getType()->getPointerElementType())) {
++              if (pobj.count(sty)) {
++                pptr_ref.insert(&*I);
++              }
++            }
++            // struct ** field
++            if (auto pty = dyn_cast<PointerType>(I->getType())) {
++              if (pty = dyn_cast<PointerType>(pty->getPointerElementType())) {
++                if (auto sty = get_pstr_type(pty->getPointerElementType())) {
++                  if (pobj.count(sty)) {
++                    ValueSet ldset;
++                    std::set<unsigned> skipset = {Instruction::Add, Instruction::Sub,
++                                                  Instruction::Shl, Instruction::GetElementPtr};
++                    collect(&*I, Instruction::Load, 0, &skipset, &ldset);
++                    for (auto ld : ldset) {
++                      pptr_ref.insert(ld);
++                    }
++                  }
++                }
++              }
++            }
++          } else if (isa<LoadInst>(&*I)) {
++            if (I->getType()->isPointerTy()) {
++              if (is_skip_ptr(&*I))
++                  continue;
++              ptr_load.insert(&*I);
++            }
++            if (auto ce = dyn_cast<ConstantExpr>(I->getOperand(0))) {
++              if (ce->getOpcode()==Instruction::GetElementPtr) {
++                if (auto sty = get_pstr_type(ce->getType()->getPointerElementType())) {
++                  if (pobj.count(sty)) {
++                    pptr_load.insert(&*I);
++                  }
++                }
++              }
++              if (ce->getOpcode()==Instruction::BitCast) {
++                if (ce = dyn_cast<ConstantExpr>(ce->getOperand(0))) {
++                  if (ce->getOpcode()==Instruction::GetElementPtr) {
++                    if (auto sty = get_pstr_type(ce->getType()->getPointerElementType())) {
++                      if (pobj.count(sty)) {
++                        pptr_load.insert(&*I);
++                      }
++                    }
++                  }
++                }
++              }
++            }
++          } else if (isa<StoreInst>(&*I)) {
++            if (auto ce = dyn_cast<ConstantExpr>(I->getOperand(1))) {
++              if (ce->getOpcode()==Instruction::GetElementPtr) {
++                if (auto sty = get_pstr_type(ce->getType()->getPointerElementType())) {
++                  if (pobj.count(sty)) {
++                    pptr_store.insert(&*I);
++                  }
++                }
++              }
++              if (ce->getOpcode()==Instruction::BitCast) {
++                if (ce = dyn_cast<ConstantExpr>(ce->getOperand(0))) {
++                  if (ce->getOpcode()==Instruction::GetElementPtr) {
++                    if (auto sty = get_pstr_type(ce->getType()->getPointerElementType())) {
++                      if (pobj.count(sty)) {
++                        pptr_store.insert(&*I);
++                      }
++                    }
++                  }
++                }
++              }
++            }
++
++          } else if (isa<CallInst>(&*I)) {
++
++            // stlr *struct.ptr, **struct.ptr gep @global
++            if (is_asm_store(&*I)) {
++              auto op = get_asm_addr(&*I);
++              auto addr = I->getOperand(op);
++              if (auto ce = dyn_cast<ConstantExpr>(addr)) {
++                if (ce->getOpcode()==Instruction::GetElementPtr) {
++                  if (auto sty = get_pstr_type(ce->getType()->getPointerElementType())) {
++                    if (pobj.count(sty))
++                      pptr_store.insert(&*I);
++                  }
++                }
++              }
++              continue;
++            }
++
++            if (is_pac_skip(&*I)) {
++              auto skip = I->getOperand(0);
++              skip_ref.insert(skip);
++              if (isa<CastInst>(skip))
++                skip_ref.insert(cast<User>(skip)->getOperand(0));
++              continue;
++            }
++            if (auto pty = dyn_cast<PointerType>(I->getType())) {
++              if (auto sty = get_pstr_type(pty->getPointerElementType())) {
++                if (pobj.count(sty)) {
++                  pptr_ref.insert(&*I);
++                  continue;
++                }
++              }
++              if (auto sty = get_pstr_type(I->getType())) {
++                if (pptr_reftype.count(sty)) {
++                  pptr_ref.insert(&*I);
++                  continue;
++                }
++              }
++            }
++            if (is_alloc_inst(&*I)) {
++              for (auto u : I->users()) {
++                if (isa<CastInst>(u) && isa<PointerType>(u->getType())) {
++                  if (auto sty = get_pstr_type(u->getType()->getPointerElementType())) {
++                    if (pobj.count(sty)) {
++                      pptr_ref.insert(&*I);
++                      break;
++                    }
++                  }
++                  if (auto sty = get_pstr_type(u->getType())) {
++                    if (pptr_reftype.count(sty)) {
++                      pptr_ref.insert(&*I);
++                      break;
++                    }
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++
++    for (auto &gv : M.globals()) {
++      // struct.xxx*
++      if (auto sty = get_pstr_type(gv.getType()->getPointerElementType())) {
++        if (pobj.count(sty) || pobj.count(sty)) {
++          gpptr.insert(&gv);
++        }
++
++      // struct.xxx
++      } else if (auto sty = get_pstr_type(gv.getType())) {
++        if (pptr_reftype.count(sty)) {
++          gpptr.insert(&gv);
++        }
++      } else if (auto ty = get_parr_type(gv.getType())) {
++        // [n x struct.xxx*]
++        if (auto sty = get_pstr_type(ty)) {
++          if (pobj.count(sty)) {
++         //   errs() << "priv struct pointer array: " << gv.getName() << "\n";
++         //   gpptr.insert(&gv);
++          }
++        }
++        // [n x struct.xxx]
++        if (auto sty = dyn_cast<StructType>(ty)) {
++          if (pptr_reftype.count(sty)) {
++            gpptr.insert(&gv);
++          }
++        }
++      }
++    }
++  }
++
++  void KDFIInstrument::collect_pptr_access(Module& M) {
++    std::set<unsigned> emptyset = {};
++    std::set<unsigned> skipset = {/*Instruction::Add,*/ Instruction::Sub,
++                                  Instruction::Shl, Instruction::GetElementPtr};
++    ValueSet eraseset;
++
++    // inter-procedural
++    for (auto ref : pptr_ref) {
++      if (auto ii = dyn_cast<Instruction>(ref)) {
++        if (dumpset.count(ii->getFunction())) {
++          print_debug(ref, nullptr, "pptr_ref");
++        }
++      }
++      ValueSet ldset, strset;
++      collect(ref, Instruction::Load, 0, &skipset, &ldset);
++      collect(ref, Instruction::Store, 1, &skipset, &strset);
++      for (auto i : ldset) {
++        pptr_load.insert(cast<Instruction>(i));
++      } for (auto i : strset) {
++        if (dumpset.count(cast<Instruction>(i)->getFunction())) {
++            print_debug(i, nullptr, "pptr_store");
++        }
++        pptr_store.insert(cast<Instruction>(i));
++      }
++    }
++
++    for (auto ref : skip_ref) {
++      ValueSet ldset, strset;
++      std::set<unsigned> skipset2 = {Instruction::Call, Instruction::Ret};
++
++      collect(ref, Instruction::Load, 0, &skipset2, &ldset);
++      collect(ref, Instruction::Store, 1, &skipset2, &strset);
++      for (auto i : ldset) {
++        skip_load.insert(cast<Instruction>(i));
++      } for (auto i : strset) {
++        skip_store.insert(cast<Instruction>(i));
++      }
++    }
++
++
++    // gptr and global pobj
++    // check load/store to gptr or global pobj
++    for (Module::iterator fi = M.begin(), fe = M.end();
++         fi != fe; ++fi) {
++      Function *func = dyn_cast<Function>(fi);
++      if (!func)
++        continue;
++      if (func->isDeclaration() || func->isIntrinsic() || (!func->hasName()))
++        continue;
++
++      for (auto &B : *func) {
++        for (auto I = B.begin(), E = B.end(); I != E; ++I) {
++          if (!isa<LoadInst>(&*I) && !isa<StoreInst>(&*I) && !is_asm(&*I))
++            continue;
++          int op=-1;
++          if (isa<LoadInst>(&*I))
++            op = 0;
++          else if (isa<StoreInst>(&*I))
++            op = 1;
++          else {
++            op = get_asm_addr(&*I);
++          }
++          if (op<0)
++            continue;
++          if (is_global(I->getOperand(op), &gpptr, &skipset)) {
++            if (isa<LoadInst>(&*I) || is_asm_load(&*I)) {
++              pptr_load.insert(&*I);
++            } else {
++              pptr_store.insert(&*I);
++            }
++          }
++        }
++      }
++    }
++  }
++
++  void KDFIInstrument::kdfi_instrumentation() {
++    //errs() << "\n ================== Instrumentation ==================\n";
++
++    instrument_pointer_access();
++    instrument_pointer_copy();
++    instrument_unsafe_access();
++    instrument_alloc();
++    return;
++
++  }
++
++  void KDFIInstrument::instrument_alloc() {
++    for (auto i : mte_alloc) {
++      _insert_mte_set(i.first, i.second, PALLOC);
++    }
++
++    // for (auto i : normal_alloc) {
++    //   _insert_mte_set(i.first, i.second, NALLOC);
++    // }
++    //for (auto i : mte_free) {
++    //  _insert_mte_set(i.first, i.second, PFREE);
++    //}
++
++    // Tag 0 is set at free. Don't set tag 0 again.
++    // for (auto i : allocset) {
++    //   _insert_mte_set(i, 0, NALLOC);
++    // }
++
++    for (auto i : mte_alloca) {
++      _insert_mte_alloca(i);
++    }
++    for (auto f : pstack_func) {
++      f->addFnAttr("stack_tagging");
++    }
++  }
++
++  void KDFIInstrument::instrument_pointer_copy() {
++    for (auto s : pptr_copy) {
++      auto i = s.first;
++      auto idx = s.second;
++      print_debug(i, nullptr, "pptr_copy");
++      _insert_pac_copy(i, idx);
++    }
++  }
++
++  void KDFIInstrument::load_internal_gvs(std::string file) {
++
++    if (!tag_global_func || tag_global_func->isDeclaration())
++      return;
++
++    std::ifstream dump;
++    std::string line;
++    dump.open(file);
++
++    if (dump.is_open()) {
++      while(std::getline(dump, line)) {
++        if (line.substr(0, 12) != "global pptr ")
++          continue;
++        else {
++          break;
++        }
++      }
++      int num = getNum(line);
++      for (int i=0; i < num; i++) {
++        std::getline(dump, line);
++        std::string sname = line.substr(3);
++        if (gv_names.count(sname))
++          continue;
++        gv_names.insert(sname);
++
++        std::smatch match;
++        std::regex_match(sname, match, std::regex("^([^0-9]+)\\.([0-9]+)$"));
++        if (match.size()==3) {
++          sname = match[1].str();
++        }
++
++        int cnt = gv2num[sname];
++        gv2num[sname] = cnt+1;
++
++      }
++      while(std::getline(dump, line)) {
++        if (line.substr(0, 14) != "global pfield ")
++          continue;
++        else {
++          break;
++        }
++      }
++      num = getNum(line);
++      for (int i=0; i < num; i++) {
++        std::getline(dump, line);
++        std::string sname = line.substr(3);
++        sname = sname.substr(0, sname.find("+"));
++        if (gv_names.count(sname))
++          continue;
++        gv_names.insert(sname);
++        std::smatch match;
++        std::regex_match(sname, match, std::regex("^([^0-9]+)\\.([0-9]+)$"));
++        if (match.size()==3) {
++          sname = match[1].str();
++        }
++
++        int cnt = gv2num[sname];
++        gv2num[sname] = cnt+1;
++        if (gv2num[sname] > 1)
++          errs() << "sname: " << sname << " gv2num: " << gv2num[sname] << "\n";
++
++      }
++    }
++    dump.close();
++  }
++
++  void KDFIInstrument::instrument_pointer_access() {
++    for (auto s : pptr_store) {
++      int src_op;
++      int dst_op;
++      if (isa<StoreInst>(s)) {
++        src_op = 0;
++        dst_op = 1;
++      }
++      else if (is_asm(s)) {
++        dst_op = get_asm_addr(s);
++        src_op = get_asm_stval(s);
++        if (dst_op < 0) {
++          print_error(s, nullptr, "no dst");
++          continue;
++        }
++      } else {
++        print_error(s, nullptr, "not store");
++        continue;
++      }
++
++      if (skip_store.count(s) ||
++          is_pac_skip(s->getOperand(src_op)) ||
++          is_pac_skip(s->getOperand(dst_op)))
++        continue;
++
++      _insert_pac_sign(s, src_op, dst_op);
++    }
++    for (auto s : pptr_load) {
++      int src_op, dst_op;
++      if (isa<LoadInst>(s)) {
++        src_op = 1000;
++        dst_op = 0;
++      }
++      else if (is_asm(s)) {
++        src_op = get_asm_ldval(s);
++        dst_op = get_asm_addr(s);
++        if (src_op < 0 || dst_op < 0) {
++          print_error(s, nullptr, "no dst");
++          continue;
++        }
++      } else {
++        print_error(s, nullptr, "not store");
++        continue;
++      }
++      if (is_pac_skip(s->getOperand(dst_op)) ||
++          skip_load.count(s))
++        continue;
++
++      _insert_pac_auth(s, src_op, dst_op);
++    }
++  }
++
++  void KDFIInstrument::_insert_pac_copy(Instruction *i, Indices *idx) { 
++    auto ty = ArrayType::get(Int32Ty, idx->size());
++    std::vector<Constant*> idx_c;
++    for (auto n : *idx) {
++      idx_c.push_back(ConstantInt::get(Int32Ty, n));
++    }
++    auto arr = ConstantArray::get(ty, idx_c);
++    auto idx_gv = new GlobalVariable(*M, ty,
++      /*isConstant=*/true,
++      /*Linkage=*/GlobalValue::InternalLinkage,
++      /*Initializer=*/arr,
++      /*Name=*/"kdfi.copy.idx");
++
++    assert(i->getNumOperands()>2);
++    Value *dst, *src, *size;
++    auto fname = get_callee_function_name(i);
++    if (fname.startswith("llvm.memcpy") || fname.startswith("llvm.memmove")) {
++      dst = i->getOperand(0);
++      src = i->getOperand(1);
++      size = i->getOperand(2);
++    } else { // kmemdup, kmemdup_nul
++      dst = i;
++      src = i->getOperand(0);
++      size = i->getOperand(1);
++    }
++    auto idx_size = ConstantInt::get(Int32Ty, idx->size());
++
++    IRBuilder<> builder(i->getNextNode());
++    auto idx_cast = builder.CreateBitCast(idx_gv, Int32PtrTy);
++    auto ci = builder.CreateCall(copyPACFunc, {dst, src, size, idx_cast, idx_size});
++  }
++
++  void KDFIInstrument::_insert_mte_alloca(Instruction *alloca) { 
++
++    Instruction *start = nullptr;
++    Instruction *end = nullptr;
++
++    if (alloca->getType() == Int8PtrTy) {
++      for (auto u : alloca->users()) {
++        if (!isa<CallInst>(u))
++          continue;
++        auto fname = get_callee_function_name(cast<Instruction>(u));
++        if (fname.startswith("llvm.lifetime.start"))
++          start = cast<Instruction>(u);
++        else if (fname.startswith("llvm.lifetime.end"))
++          end = cast<Instruction>(u);
++      }
++    } else {
++      ValueSet castset;
++      for (auto u : alloca->users()) {
++        if (u->getType()==Int8PtrTy)
++          castset.insert(u);
++      }
++      for (auto c : castset) {
++        for (auto u : c->users()) {
++          if (!isa<CallInst>(u))
++            continue;
++          auto fname = get_callee_function_name(cast<Instruction>(u));
++          if (fname.startswith("llvm.lifetime.start"))
++            start = cast<Instruction>(u);
++          else if (fname.startswith("llvm.lifetime.end"))
++            end = cast<Instruction>(u);
++        }
++      }
++    }
++    if (!start || !end)
++      return;
++
++    cast<AllocaInst>(alloca)->setAlignment(Align(16));
++    MDNode* N = MDNode::get(*C, MDString::get(*C, "priv alloca"));
++    alloca->setMetadata("alloca_tagging", N); 
++ 
++    IRBuilder<> builder(alloca);
++    // set MTE tag
++    builder.SetInsertPoint(start);
++    builder.CreateCall(allocMTEFunc, {start->getOperand(1), start->getOperand(0)});
++
++    builder.SetInsertPoint(end);
++    builder.CreateCall(allocNormalFunc, {end->getOperand(1), end->getOperand(0)});
++  }
++
++  void KDFIInstrument::_insert_mte_set(Instruction *i, int size, IType type) {
++
++      Function *func = i->getFunction();
++      IRBuilder<> builder(i->getNextNode());
++      if (type == PALLOC) {
++        auto i2 = i;
++        auto alloc_func = allocMTEFunc;
++
++        print_debug(i, nullptr, "insert_mte_alloc");
++
++        if (func->getName() == "sk_prot_alloc")
++          return;
++        auto fname = get_callee_function_name(i);
++        Instruction *ci;
++        if (i->getType() != Type::getInt8PtrTy(*C))
++          i2 = cast<Instruction>(
++                      builder.CreateBitCast(i, Type::getInt8PtrTy(*C)));
++
++        if ((fname.startswith("kzalloc") ||
++            fname.startswith("kmalloc") ||
++            fname.startswith("__kmalloc") ||
++            fname.startswith("kvmalloc_node") ||
++            fname.startswith("__vmalloc"))
++            && !fname.startswith("kmalloc_array")) {
++            ci = builder.CreateCall(alloc_func,
++                           {i2, i->getOperand(0)});
++        } else if (fname.startswith("kmem_cache_alloc")) {
++          alloc_func = kmemMTEFunc;
++          auto slab = cast<CallInst>(i)->getArgOperand(0);
++          slab = builder.CreateBitCast(slab, Type::getInt8PtrTy(*C));
++          ci = cast<Instruction>(builder.CreateCall(alloc_func, {i2, slab}));
++        } else if ((fname.startswith("kmalloc_array") ||
++              fname.startswith("kcalloc")) && i->getNumOperands()>1) {
++          Value *sizeV=cast<CallInst>(i)->getOperand(1);
++          Value *mul;
++          if (sizeV->getType()==Int32Ty) {
++            mul = builder.CreateMul(cast<CallInst>(i)->getArgOperand(0),
++                ConstantInt::get(Int64Ty, size));
++          } else {
++            mul = builder.CreateMul(cast<CallInst>(i)->getArgOperand(0),
++              cast<CallInst>(i)->getArgOperand(1));
++          }
++          ci = cast<Instruction>(builder.CreateCall(alloc_func, {i2, mul}));
++        } else {
++          ci = cast<Instruction>(
++                builder.CreateCall(alloc_func,
++                          {i2, ConstantInt::get(Int64Ty, size)}));
++        }
++        auto i3 = ci;
++        if (i2 != i)
++          i3 = cast<Instruction>(builder.CreateBitCast(ci, i->getType()));
++        i->replaceAllUsesWith(i3);
++        if (ci->getOperand(0) == i3)
++          ci->setOperand(0, i2);
++        if (i2->getOperand(0) == i3)
++          i2->setOperand(0, i);
++      }
++      else if (type == NALLOC) {
++        CallInst *ci;
++        auto fname = get_callee_function_name(i);
++        auto alloc_func = allocNormalFunc;
++        if ((fname.startswith("kzalloc") ||
++            fname.startswith("kmalloc") ||
++            fname.startswith("__kmalloc") ||
++            fname.startswith("kvmalloc_node") ||
++            fname.startswith("__vmalloc"))
++            && !fname.startswith("kmalloc_array")) {
++
++            ci = builder.CreateCall(alloc_func,
++                           {i, i->getOperand(0)});
++        } else if ((fname.startswith("kmalloc_array") ||
++              fname.startswith("kcalloc")) && i->getNumOperands()>1) {
++          Value *sizeV=cast<CallInst>(i)->getOperand(1);
++          Value *mul;
++          if (sizeV->getType()==Int32Ty) {
++            mul = builder.CreateMul(cast<CallInst>(i)->getArgOperand(0),
++                ConstantInt::get(Int64Ty, size));
++          } else {
++            mul = builder.CreateMul(cast<CallInst>(i)->getArgOperand(0),
++              cast<CallInst>(i)->getArgOperand(1));
++          }
++          ci = cast<CallInst>(builder.CreateCall(alloc_func, {i, mul}));
++        } else {
++          if (fname.startswith("__get_free_pages")) {
++            size=4096;
++          }
++          ci = builder.CreateCall(alloc_func,
++                         {i, ConstantInt::get(Int64Ty, size)});
++        }
++      }
++      else if (type == PFREE) {
++        builder.SetInsertPoint(i);
++        builder.CreateCall(allocNormalFunc,
++                           {i->getOperand(0), ConstantInt::get(Int64Ty, size)});
++        StringRef fname = get_callee_function_name(i);
++        int op;
++        op = 0;
++        if (fname.startswith("kmem_cache_free")||fname.startswith("devm_kfree")) {
++            auto tagged = builder.CreateCall(setfKDFIFunc, i->getOperand(1));
++            cast<CallInst>(i)->setArgOperand(1, tagged);
++        }
++        auto tagged = builder.CreateCall(setfKDFIFunc, i->getOperand(op));
++        cast<CallInst>(i)->setArgOperand(op, tagged);
++        print_debug(i->getParent(), i->getFunction(), "mte free");
++      }
++  }
++
++  void KDFIInstrument::register_set_tag(Instruction *ii, int op,
++          unsigned long long tag) {
++    mte *ts = new mte;
++    ts->func = ii->getFunction();
++    ts->base = ii;
++    ts->opNum = op;
++    ts->tag = tag;
++
++    //char str[20];
++    //sprintf(str, "set tag %.1x", tag);
++    //print_debug(ii, nullptr, str);
++
++    bool exists = false;
++    for (auto _ts : mtes) {
++      if (_ts->is_same(ts)) {
++        exists = true;
++        break;
++      }
++      if ((_ts->base == ii) && (_ts->opNum == op)) {
++        if (tag == 0xf) {
++          _ts->tag = 0xf;
++          exists = true;
++          break;
++          }
++        else if (_ts->tag == 0xf) {
++          exists = true;
++          break;
++        }
++      }
++    }
++    if (!exists) {
++      mtes.insert(ts);
++    }
++    else {
++      delete ts;
++    }
++  }
++
++  void KDFIInstrument::_instrument_set_tag(Instruction *ii, int op,
++          unsigned long long tag) {
++    IRBuilder<> builder(ii);
++    Value *src, *tagged, *cast0, *cast1;
++    assert(tag==0);
++
++    src = ii->getOperand(op);
++    //if (isa<PointerType>(src->getType())) {
++    //  cast0 = builder.CreatePtrToInt(src, Int64Ty);
++    //} else {
++    //  cast0 = src;
++    //}
++
++    //tagged = builder.CreateAnd(cast0, ConstantInt::get(Int64Ty,0xf0ffffffffffffff));
++
++    //if (isa<PointerType>(src->getType())) {
++    //  cast1 = builder.CreateIntToPtr(tagged, src->getType());
++    //} else {
++    //  cast1 = tagged;
++    //}
++
++    //ii->setOperand(op, cast1);
++
++    if (isa<IntegerType>(src->getType()))
++        cast0 = builder.CreateIntToPtr(src, Int8PtrTy);
++    else
++        cast0 = builder.CreateBitCast(src, Int8PtrTy);
++
++    tagged = builder.CreateCall(setnKDFIFunc, {cast0});
++
++    cast1 = builder.CreateBitCast(tagged, src->getType());
++    ii->setOperand(op, cast1);
++  }
++
++
++  void KDFIInstrument::reset_gv(std::map<Constant*,Constant*> *modmap, Constant *c) {
++    if (!isa<ConstantExpr>(c))
++      return;
++    errs() << "c: " << *c << "\n";
++    auto ce = cast<ConstantExpr>(c);
++    for (int i=0; i < ce->getNumOperands(); ++i) {
++      auto elem = ce->getOperand(i);
++      if (modmap->count(elem)) {
++        errs() << "mod : " << *elem << "\n";
++        errs() << "ori : " << *((*modmap)[elem]) << "\n";
++        ce->setOperand(i, (*modmap)[elem]);
++        errs() << "after: " << *ce << "\n";
++      } else {
++        reset_gv(modmap, elem);
++      }
++    }
++  }
++
++  void KDFIInstrument::instrument_unsafe_access() {
++    for (auto i : unsafe_access) {
++      if (is_kdfi_skip_func(cast<Instruction>(i)->getFunction()->getName().str()))
++        continue;
++      if (isa<StoreInst>(i)) {
++        _instrument_set_tag(cast<Instruction>(i), 1, 0x0);
++      } else if (isa<LoadInst>(i)) {
++        _instrument_set_tag(cast<Instruction>(i), 0, 0x0);
++      } else if (is_asm(i)) {
++        int op = get_asm_addr(i);
++        if (op>=0) {
++          _instrument_set_tag(cast<Instruction>(i), op, 0x0);
++        }
++      }
++    }
++    return;
++  }
++
++
++  void KDFIInstrument::reset_nullcmp(Value *auth, Instruction *src) {
++    ValueSet visited;
++    ValueList worklist;
++    worklist.push_back(auth);
++
++    while(worklist.size()) {
++      Value *v = worklist.front();
++      worklist.pop_front();
++      if (visited.count(v))
++        continue;
++      visited.insert(v);
++      if (is_nullcmp(v))
++        cast<Instruction>(v)->setOperand(0, src);
++      else if (isa<CastInst>(v)) {
++        for (auto u : v->users()) {
++          worklist.push_back(u);
++        }
++      }
++    }
++  }
++  void KDFIInstrument::_insert_enforce_zero(Instruction *ld) {
++    Value *zero_ptr, *cast0, *cast1;
++
++    if (ld->getType()->isAggregateType()) {
++      for (auto u : ld->users()) {
++        if (isa<ExtractValueInst>(u)) {
++          ld = cast<Instruction>(u);
++          break;
++        }
++        if (isa<PHINode>(u)) {
++          for (auto uu : cast<Instruction>(u)->users()) {
++            if (isa<ExtractValueInst>(uu)) {
++              ld = cast<Instruction>(uu);
++              break;
++            }
++          }
++          if (isa<ExtractValueInst>(ld))
++            break;
++        }
++        if (ld->getType()->isAggregateType())
++          return;
++      }
++    }
++    IRBuilder<> builder(ld->getNextNode());
++
++    if (isa<IntegerType>(ld->getType()))
++        cast0 = builder.CreateIntToPtr(ld, Int8PtrTy);
++    else if (ld->getType() != Int8PtrTy)
++        cast0 = builder.CreateBitCast(ld, Int8PtrTy);
++    else 
++      cast0 = ld;
++
++    zero_ptr = builder.CreateCall(enforce0KDFIFunc, {cast0});
++
++    cast1 = builder.CreateBitCast(zero_ptr, ld->getType());
++
++    ld->replaceAllUsesWith(cast1);
++
++    if (cast<Instruction>(cast0)->getOperand(0) == cast1)
++      cast<Instruction>(cast0)->setOperand(0, ld);
++    if (cast<Instruction>(zero_ptr)->getOperand(0) == cast1)
++      cast<Instruction>(zero_ptr)->setOperand(0, cast0);
++  }
++
++  // src_op: loaded value, dst_op: load address
++  void KDFIInstrument::_insert_pac_auth(Instruction *ld, int src_op, int dst_op) {
++    if (dumpset.count(ld->getFunction()))
++      errs() <<"auth" << src_op << "-" << dst_op << " " << *ld <<"\n";
++
++    Value *addr = ld->getOperand(dst_op);
++
++    if (auto c = dyn_cast<Constant>(ld)) {
++      if (c->isZeroValue()) {
++        return;
++      }
++      if (auto ci = dyn_cast<ConstantInt>(c)) {
++        if (ci->getZExtValue() < 0xf000000000000000)
++          return;
++      }
++    }
++
++    if (ld->getType()->isAggregateType()) {
++      for (auto u : ld->users()) {
++        if (isa<ExtractValueInst>(u)) {
++          ld = cast<Instruction>(u);
++          break;
++        }
++        if (isa<PHINode>(u)) {
++          for (auto uu : cast<Instruction>(u)->users()) {
++            if (isa<ExtractValueInst>(uu)) {
++              ld = cast<Instruction>(uu);
++              break;
++            }
++          }
++          if (isa<ExtractValueInst>(ld))
++            break;
++        }
++        if (ld->getType()->isAggregateType())
++          return;
++      }
++    }
++
++    if (isa<IntegerType>(ld->getType())) {
++      if (ld->getType() != Int64Ty)
++        return;
++    }
++
++    IRBuilder<> builder(ld->getNextNode());
++    Value *cast0, *cast1;
++
++    // XOR inline
++    //if (isa<PointerType>(ld->getType())) {
++    //  cast0 = builder.CreatePtrToInt(ld, Int64Ty);
++    //} else {
++    //  cast0 = ld;
++    //}
++
++    //Value *xor0 = builder.CreateCall(xorPACFunc, {cast0});
++    //if (isa<PointerType>(ld->getType())) {
++    //  cast1 = builder.CreateIntToPtr(xor0, ld->getType());
++    //} else {
++    //  cast1 = xor0;
++    //}
++
++    //ld->replaceAllUsesWith(cast1);
++    //if (cast0 != ld) {
++    //  cast<User>(cast0)->setOperand(0, ld);
++    //}
++    //if (cast<User>(xor0)->getOperand(0) == cast1) {
++    //  cast<User>(xor0)->setOperand(0, ld);
++    //}
++
++    if (isa<IntegerType>(ld->getType()))
++      cast0 = builder.CreateIntToPtr(ld, Int8PtrTy);
++    else if (ld->getType() != Int8PtrTy)
++      cast0 = builder.CreateBitCast(ld, Int8PtrTy);
++    else {
++      cast0 = ld;
++    }
++    addr = builder.CreatePtrToInt(addr, Int64Ty);
++    Value *auth = builder.CreateCall(authPACFunc, {cast0, addr});
++
++    if (isa<IntegerType>(ld->getType()))
++      cast1 = builder.CreatePtrToInt(auth, ld->getType());
++    else
++      cast1 = builder.CreateBitCast(auth, ld->getType());
++
++    ld->replaceAllUsesWith(cast1);
++    if (cast0 != ld)
++      cast<User>(cast0)->setOperand(0, ld);
++    if (cast<User>(auth)->getOperand(0)==cast1)
++      cast<User>(auth)->setOperand(0, ld);
++
++    reset_nullcmp(cast1, ld);
++  }
++
++  void KDFIInstrument::_insert_pac_sign(Instruction *ii, int src_op, int dst_op) {
++    if (dumpset.count(ii->getFunction()))
++      errs() <<"sign-" << src_op << "-" << dst_op << " " << *ii <<"\n";
++
++    Value *src = ii->getOperand(src_op);
++    Value *dst = ii->getOperand(dst_op);
++    IRBuilder<> builder(ii);
++    Value *cast0, *cast1;
++    if (auto c = dyn_cast<Constant>(src)) {
++      if (c->isZeroValue()) {
++        return;
++      }
++      if (auto ci = dyn_cast<ConstantInt>(c)) {
++        if (ci->getZExtValue() < 0xf000000000000000)
++          return;
++      }
++    }
++
++    if (isa<IntegerType>(src->getType())) {
++      if (src->getType() != Int64Ty)
++        return;
++    }
++
++    // XOR inline
++    //if (isa<PointerType>(src->getType())) {
++    //  cast0 = builder.CreatePtrToInt(src, Int64Ty);
++    //} else {
++    //  cast0 = src;
++    //}
++
++    //Value *xor3 = builder.CreateCall(xorPACFunc, {cast0});
++
++    //if (isa<PointerType>(src->getType())) {
++    //  cast1 = builder.CreateIntToPtr(xor3, src->getType());
++    //} else {
++    //  cast1 = xor3;
++    //}
++
++    //ii->setOperand(src_op, cast1);
++
++    if (isa<IntegerType>(src->getType()))
++      cast0 = builder.CreateIntToPtr(src, Int8PtrTy);
++    else if (src->getType() != Int8PtrTy)
++      cast0 = builder.CreateBitCast(src, Int8PtrTy);
++    else
++      cast0 = src;
++    if (isa<PointerType>(dst->getType()))
++      dst = builder.CreatePtrToInt(dst, Int64Ty);
++    else
++      dst = builder.CreateBitCast(dst, Int64Ty);
++    Value *strip = builder.CreateCall(signPACFunc, {cast0, dst});
++
++    if (isa<IntegerType>(src->getType()))
++      cast1 = builder.CreatePtrToInt(strip, src->getType());
++    else if (src->getType() != Int8PtrTy)
++      cast1 = builder.CreateBitCast(strip, src->getType());
++    else {
++      cast1 = strip;
++    }
++    ii->setOperand(src_op, cast1);
++  }
++
++  // TODO: print size from kdfi
++  void KDFIInstrument::tag_globals(Module &M)
++  {
++    if (!tag_global_func || tag_global_func->isDeclaration())
++      return;
++    errs() << "tag_globals : " << gpobj.size() << "\n";
++    // align globals
++    for (auto obj : gpobj) {
++      errs() << *obj << "\n";
++      //cast<GlobalVariable>(obj)->setAlignment(Align(16));
++    }
++
++    IRBuilder<> builder(tag_global_func->back().getTerminator());
++    for (auto obj : gpobj) {
++      errs() << "gpobj: " << obj->getName() << "\n";
++      Type *ty = obj->getType()->getPointerElementType();
++      unsigned size = 0;
++      if (isa<PointerType>(ty))
++        size = 8;
++      else if (isa<IntegerType>(ty)) {
++        size = ty->getPrimitiveSizeInBits()/8;
++      } else if (isa<StructType>(ty)) {
++        size = DL->getTypeStoreSizeInBits(cast<StructType>(ty))/8;
++      }
++      auto cast = builder.CreateBitCast(obj, Int8PtrTy);
++      auto tagI = builder.CreateCall(allocMTEFunc, {cast, ConstantInt::get(Int64Ty, size)});
++      errs() << *tagI << "\n";
++    }
++
++    return;
++  }
++
++  void KDFIInstrument::sign_globals(Module &M)
++  {
++    if (!sign_global_func || sign_global_func->isDeclaration())
++      return;
++
++    errs() << "sign_globals : " << gpptr.size() << "+" << gpfield.size() <<"\n";
++
++    IRBuilder<> builder(sign_global_func->back().getTerminator());
++    for (auto p : gpfield) {
++      errs() << p.first->getName() <<"\n";
++      int offset = p.second;
++      auto addr = builder.CreateBitCast(p.first, Int64Ty);
++      errs() <<*addr <<"\n";
++      addr = builder.CreateAdd(addr, ConstantInt::get(Int64Ty, offset));
++      errs() << *addr << "\n";
++      addr = builder.CreateBitCast(addr, Int64Ty->getPointerTo());
++      auto addr_dst = builder.CreateBitCast(addr, Int64Ty->getPointerTo()->getPointerTo()); // i8 **
++      auto ld = builder.CreateLoad(Int64Ty->getPointerTo(), addr); // i8 *
++      auto sign = builder.CreateCall(signPACFunc, {ld, addr});
++      builder.CreateStore(sign, addr_dst);
++
++    }
++
++    for (auto ptr : gpptr) {
++      errs() << *ptr << "\n";
++      Type *ty = ptr->getType()->getPointerElementType();
++      auto addr = builder.CreateBitCast(ptr, Int8PtrTy->getPointerTo()); // i8 **
++      auto addr_dst=addr;
++      auto ld = builder.CreateLoad(Int8PtrTy, addr); // i8 *
++      addr = builder.CreatePtrToInt(addr, Int64Ty); // int64
++      auto sign = builder.CreateCall(signPACFunc, {ld, addr});
++      builder.CreateStore(sign, addr_dst);
++    }
++  }
++
++
++  void KDFIInstrument::sign_lists(Module &M)
++  {
++    if (!sign_list_func || sign_list_func->isDeclaration())
++      return;
++    auto list_num = M.getGlobalVariable("list_num");
++    if (!list_num) {
++      errs() << "list_num not found!\n";
++      return;
++    }
++    auto list_arr = M.getGlobalVariable("list_gvfields");
++    if (!list_arr) {
++      errs() << "list_gvfields not found!\n";
++      return;
++    }
++  
++    errs() << "sign_lists : " << list_gvs.size() <<"\n";
++    list_num->setInitializer(ConstantInt::get(Int32Ty, list_gvs.size()));
++    
++    auto ty = ArrayType::get(Int64Ty, list_gvs.size());
++    std::vector<Constant*> vec;
++    for (auto n : list_gvs) {
++      auto gv = n.first;
++      auto offset = n.second;
++      auto c = ConstantExpr::getBitCast(gv, Int64Ty);
++      c = ConstantExpr::getAdd(c, ConstantInt::get(Int64Ty, offset));
++      vec.push_back(c);
++    }
++    auto arr = ConstantArray::get(ty, vec);
++
++    list_arr->setInitializer(arr);
++
++    errs() << *list_num <<"\n";
++    errs() << *list_arr << "\n";
++  }
++
++/*  class KDFIInstrumentLegacyPass */
++class KDFIInstrumentLegacyPass : public ModulePass {
++public:
++  static char ID;
++  KDFIInstrumentLegacyPass() : ModulePass(ID) {}
++
++  bool doInitialization(Module &M) {
++    LLVMContext &C = M.getContext();
++    return true;
++  }
++
++  virtual bool runOnModule(Module &M) {
++    KDFIInstrument SPI;
++    SPI.Initialize(M);
++    SPI.Run(M);
++
++    if (std::getenv("DUMP_MODULE"))
++      errs() << M << "\n";
++
++    return false;
++  }
++}; // class KDFIInstrumentLegacyPass
++
++} // namespace
++
++char KDFIInstrumentLegacyPass::ID = 0;
++INITIALIZE_PASS_BEGIN(KDFIInstrumentLegacyPass, "kdfi_instrument",
++                      "KDFIInstrumentPass: Kernel DFI Instrument pass",
++                      false, false)
++INITIALIZE_PASS_END(KDFIInstrumentLegacyPass, "kdfi_instrument",
++                    "KDFIInstrumentPass: Kernel DFI Instrument pass",
++                    false, false)
++ModulePass *llvm::createKDFIInstrumentLegacyPassPass() {
++  return new KDFIInstrumentLegacyPass();
++}
++
++//KDFIInstrumentPass::KDFIInstrumentPass() {}
++PreservedAnalyses KDFIInstrumentPass::run(Module &M,
++                                          ModuleAnalysisManager &AM) {
++    KDFIInstrument SPI;
++    SPI.Initialize(M);
++    SPI.Run(M);
++
++    if (std::getenv("DUMP_MODULE"))
++      errs() << M << "\n";
++
++
++    return PreservedAnalyses::none();
++
++}
+diff --git a/llvm/lib/Transforms/Instrumentation/PPACUtility.cpp b/llvm/lib/Transforms/Instrumentation/PPACUtility.cpp
+new file mode 100644
+index 000000000..c46249f9f
+--- /dev/null
++++ b/llvm/lib/Transforms/Instrumentation/PPACUtility.cpp
+@@ -0,0 +1,789 @@
++#include "PPACUtility.h"
++#include <string>
++#include <list>
++#include <map>
++#include <set>
++#include <unordered_map>
++#include <unordered_set>
++bool is_builtin_container_of(Value *v) {
++    if (!v)
++        return false;
++    if (!isa<CallInst>(v))
++        return false;
++    CallInst *ci = cast<CallInst>(v);
++    if (get_callee_function_name(ci) == "__builtin_container_of")
++      return true;
++    return false;
++}
++
++bool is_same_uselist(ValueList* vl0, ValueList *vl1) {
++    if (vl0->size() != vl1->size())
++        return false;
++
++    auto it0 = vl0->begin();
++    auto it1 = vl1->begin();
++    for (; it0 != vl0->end(); ++it0, ++it1) {
++        if (*it0 != *it1) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool preserve_pac(Instruction *ii, InstructionSet *visited) {
++    if (visited->count(ii))
++        return false;
++    visited->insert(ii);
++    for (auto u : ii->users()) {
++        if (!isa<Instruction>(u))
++            continue;
++        if (isa<LoadInst>(u))
++            continue;
++        else if (isa<CallInst>(u)) {
++            if (cast<CallInst>(u)->isInlineAsm())
++                return true;
++            Function *func = cast<CallInst>(u)->getCalledFunction();
++            if (!func)
++                continue;
++            if (!func->hasName())
++                continue;
++            if (func->getName() == "__builtin_container_of")
++                continue;
++            return true;
++        }
++        else if (isa<StoreInst>(u)) {
++            if (ii == cast<User>(u)->getOperand(0)) {
++                return true;
++            }
++        }
++        else if (isa<ReturnInst>(u)) {
++            return true;
++        }
++
++        if (preserve_pac(cast<Instruction>(u), visited))
++            return true;
++    }
++    return false;
++}
++
++Instruction *current_from_cred(Value *cred_load) {
++    if (!isa<LoadInst>(cred_load))
++        return nullptr;
++    Value *v = cast<Instruction>(cred_load)->getOperand(0);
++    if (!isa<GetElementPtrInst>(v))
++        return nullptr;
++    v = cast<Instruction>(v)->getOperand(0);
++    if (!isa<IntToPtrInst>(v))
++        return nullptr;
++    v = cast<Instruction>(v)->getOperand(0);
++    if (!isa<CallInst>(v))
++        return nullptr;
++    return cast<Instruction>(v);
++}
++bool is_asm(Value *v) {
++  if (!isa<CallBase>(v))
++    return false;
++  return cast<CallBase>(v)->isInlineAsm();
++}
++bool is_asm_get_current(Value *v) {
++    if (!isa<CallBase>(v))
++        return false;
++    if (!cast<CallBase>(v)->isInlineAsm())
++        return false;
++
++    InlineAsm *ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++    auto str = ia->getAsmString();
++    if (str.compare("mrs $0, sp_el0") != 0)
++        return false;
++    return true;
++}
++
++// return true if v is asm load and op is the loaded value
++bool is_asm_load(Value *v, int op) {
++    if (!isa<CallBase>(v))
++        return false;
++    if (!cast<CallBase>(v)->isInlineAsm())
++        return false;
++
++    auto asm_op = get_asm_ldval(v);
++
++    if (asm_op > 0 && ((op < 0) || asm_op == op))
++        return true;
++
++    return false;
++}
++
++// return true if v is asm store and op is the stored value
++bool is_asm_store(Value *v, int op) {
++    if (!isa<CallBase>(v))
++        return false;
++    if (!cast<CallBase>(v)->isInlineAsm())
++        return false;
++    auto asm_op = get_asm_stval(v);
++
++    if (asm_op > 0 && ((op < 0) || asm_op == op))
++        return true;
++
++    return false;
++}
++
++bool is_asm_access(Value *v, int op) {
++    if (!isa<CallBase>(v))
++        return false;
++    if (!cast<CallBase>(v)->isInlineAsm())
++        return false;
++    if (cast<User>(v)->getNumOperands() <= op)
++        return false;
++    InlineAsm *ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++    auto str = ia->getAsmString();
++    if (str.compare("// atomic")==0 && op==0)
++        return true;
++    if (str.find("// cmpxchg_case")==0 && op==0)
++        return true;
++    if ((is_asm_store(v) || is_asm_load(v)) &&
++        (op == get_asm_addr(v)))
++        return true;
++
++    return false;
++}
++
++int get_asm_addr(Value *v) {
++    InlineAsm *ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++    auto str = ia->getAsmString();
++    if (str.find("// atomic") ==0)
++        return 0;
++    if (str.find("// cmpxchg_case")==0) {
++        return 0;
++    } if (str.compare("stlr $1, $0") == 0)
++        return 0;
++    if (str.compare("stlr ${1:w}, $0") == 0)
++        return 0;
++    if (str.compare("stlrb ${1:w}, $0") == 0)
++        return 0;
++    if (str.compare("ldar $0, $1") == 0)
++        return 0;
++    if (str.compare("ldar ${0:w}, $1") == 0)
++        return 0;
++    if (str.compare("ldarb ${0:w}, $1") == 0)
++        return 0;
++    if (str.find("prfm\x09pstl1strm") != std::string::npos) {
++        return 0;
++    }
++    if (str.find("\x09ld") != std::string::npos)
++        return 0;
++    if (str.find("\x09st") != std::string::npos)
++        return 0;
++    return -1;
++}
++
++// get asm loaded value or stored value
++int get_asm_ldval(Value *v) {
++    InlineAsm *ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++    auto str = ia->getAsmString();
++    if (str.find("// atomic")==0)
++        return 1000;
++    if (str.find("// cmpxchg_case")==0)
++        return 1000;
++    if (str.find("prfm\x09pstl1strm") != std::string::npos)
++        return 1000;
++    if (str.find("\x09ld") != std::string::npos)
++        return 1000;
++    if (str.compare("ldar $0, $1") == 0)
++        return 1000;
++    if (str.compare("ldar ${0:w}, $1") == 0)
++        return 1000;
++    if (str.compare("ldarb ${0:w}, $1") == 0)
++        return 1000;
++    return -1;
++}
++
++// get asm loaded value or stored value
++int get_asm_stval(Value *v) {
++    InlineAsm *ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++    auto str = ia->getAsmString();
++    //if (str.compare("// atomic")==0)
++    //    return 1000;
++    if (str.find("// cmpxchg_case")==0)
++        return 2;
++    if (str.find("prfm\x09pstl1strm") != std::string::npos)
++        return 1;
++    if (str.compare("stlr $1, $0") == 0)
++        return 1;
++    if (str.compare("stlr ${1:w}, $0") == 0)
++        return 1;
++    if (str.compare("stlrb ${1:w}, $0") == 0)
++        return 1;
++    if (str.find("\x09st") != std::string::npos)
++        return 1;
++    return -1;
++}
++
++bool is_asm_jump(Value *v) {
++    if (!isa<CallBase>(v))
++        return false;
++    if (!cast<CallBase>(v)->isInlineAsm())
++        return false;
++
++    InlineAsm *ia = cast<InlineAsm>(cast<CallBase>(v)->getCalledOperand());
++    auto str = ia->getAsmString();
++    if (str.find("__jump_table") != std::string::npos)
++        return true;
++    if (str.find("adrp\x09")==0)
++        return true;
++    return false;
++
++}
++
++bool is_global(Value *v, ValueSet *gvset, std::set<unsigned> *skipset) {
++    if (!isa<Constant>(v))
++        return false;
++    if (isa<GlobalVariable>(v)) {
++        if (gvset->count(v)) {
++            return true;
++        }
++        else {
++            return false;
++        }
++    }
++    else if (isa<ConstantExpr>(v)) {
++      if (skipset)
++        if (skipset->count(cast<ConstantExpr>(v)->getOpcode()))
++          return false;
++      if (auto u = dyn_cast<User>(v)) {
++        for (int i=0; i<u->getNumOperands(); ++i) {
++          if (is_global(u->getOperand(i), gvset))
++            return true;
++        }
++      }
++    }
++    return false;
++}
++
++StructType *get_pstr_type(Value *v)
++{
++    Type *ty = v->getType();
++    if (auto sty = get_pstr_type(ty))
++        return sty;
++    return nullptr;
++}
++
++// return struct.xxx from struct.xxx*
++StructType *get_pstr_type(Type *ty) {
++  if (isa<PointerType>(ty)) {
++    if (isa<StructType>(ty->getPointerElementType())) {
++      if (ty->getPointerElementType()->getStructName().startswith("struct.atomic"))
++        return nullptr;
++      return cast<StructType>(ty->getPointerElementType());
++    }
++  }
++  return nullptr;
++}
++
++// return ty from [n x ty]*
++Type *get_parr_type(Type *ty) {
++  if (isa<PointerType>(ty)) {
++    if (auto aty = dyn_cast<ArrayType>(ty->getPointerElementType())) {
++        return aty->getElementType();
++    } else if (auto vty = dyn_cast<VectorType>(ty->getPointerElementType())) {
++        return vty->getElementType();
++    }
++  }
++  return nullptr;
++}
++
++void print_error(StringRef v, Function *func, StringRef msg) {
++    errs() << "[ERROR] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    errs() << v << "\n";
++}
++void print_report(StringRef v, Function *func, StringRef msg) {
++    errs() << "[REPORT] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    errs() << v << "\n";
++}
++void print_debug(StringRef v, Function *func, StringRef msg) {
++    errs() << "[DEBUG] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    errs() << v << "\n";
++}
++void print_debug(Value *v, StringRef msg) {
++    errs() << "[DEBUG] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (auto arg = dyn_cast<Argument>(v)) {
++        errs() << arg->getParent()->getName() << ": ";
++    } else if (auto ii = dyn_cast<Instruction>(v)) {
++        if (ii->getParent()) {
++            if (ii->getFunction())
++                errs() << ii->getFunction()->getName() << ": ";
++        }
++    }
++    if (isa<GlobalVariable>(v))
++        errs() << v->getName() << "\n";
++    else
++        errs() << *v << "\n";
++}
++
++
++void print_error(Value *v, Function *func, StringRef msg) {
++    errs() << "[ERROR] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    else {
++        if (auto ii = dyn_cast<Instruction>(v)) {
++            if (ii->getParent()) {
++                if (ii->getFunction())
++                    errs() << ii->getFunction()->getName() << ": ";
++            }
++        }
++    }
++    errs() << *v << "\n";
++}
++void print_report(Value *v, Function *func, StringRef msg) {
++    errs() << "[REPORT] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    else {
++        if (auto ii = dyn_cast<Instruction>(v)) {
++            if (ii->getParent()) {
++                if (ii->getFunction())
++                    errs() << ii->getFunction()->getName() << ": ";
++            }
++        }
++    }
++    errs() << *v << "\n";
++}
++void print_debug(Value *v, Function *func, StringRef msg) {
++    errs() << "[DEBUG] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    else {
++        if (auto ii = dyn_cast<Instruction>(v)) {
++            if (ii->getParent()) {
++                if (ii->getFunction())
++                    errs() << ii->getFunction()->getName() << ": ";
++            }
++        }
++    }
++    errs() << *v << "\n";
++}
++void print_error(Type *v, Function *func, StringRef msg) {
++    errs() << "[ERROR] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    if (isa<StructType>(v))
++        errs() << v->getStructName() << "\n";
++    else
++        errs() << *v << "\n";
++}
++void print_report(Type *v, Function *func, StringRef msg) {
++    errs() << "[REPORT] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    if (isa<StructType>(v))
++        errs() << v->getStructName() << "\n";
++    else
++        errs() << *v << "\n";
++}
++void print_debug(Type *v, Function *func, StringRef msg) {
++    errs() << "[DEBUG] ";
++    if (msg != "")
++        errs() << msg << " - ";
++    if (func)
++        errs() << func->getName() << ": ";
++    if (isa<StructType>(v))
++        errs() << v->getStructName() << "\n";
++    else
++        errs() << *v << "\n";
++}
++
++std::string get_struct_name(std::string tname)
++{
++    // strip '.XXX' at the last of the name
++    if (tname.find_first_of(".") != tname.find_last_of("."))
++        return tname.substr(0, tname.find_last_of("."));
++    return tname;
++}
++
++Function* get_callee_function_direct(Instruction* i)
++{
++    CallInst* ci = dyn_cast<CallInst>(i);
++    if (Function* f = ci->getCalledFunction())
++        return f;
++    Value* cv = ci->getCalledOperand();
++    Function* f = dyn_cast<Function>(cv->stripPointerCasts());
++    return f;
++}
++
++StringRef get_callee_function_name(Instruction* i)
++{
++    if (Function* f = get_callee_function_direct(i))
++        return f->getName();
++    return "";
++}
++
++
++bool is_use_def(User *u, Value *d) {
++    //errs() << "use-def \nuser:" << *u << "\ndef: " << *d << "\n";
++    for (auto &op : u->operands()) {
++        if (op == d)
++            return true;
++    }
++    return false;
++}
++bool is_use_def_recur(User*u, Value*d, ValueSet *visited) {
++    if (visited->count(u)>0)
++        return false;
++    visited->insert(u);
++    //errs() << "is_use_def_recur: " << *u << " && " << *d << "\n";
++    for (auto &op : u->operands()) {
++        if (op == d)
++            return true;
++        if (auto ce = dyn_cast<ConstantExpr>(op)) {
++            if (is_use_def_recur(ce, d, visited))
++                return true;
++        }
++    }
++    return false;
++}
++InstructionSet *get_inst(Value *v, bool debug, Function* func) {
++    InstructionSet iset;
++
++    if (isa<Instruction>(v)) {
++        iset.insert(cast<Instruction>(v));
++        return new InstructionSet(iset);
++    }
++
++    ValueSet visited;
++    ValueList worklist;
++    worklist.push_back(v);
++
++
++    if (debug) {
++        errs() << "  get_inst " << *v;
++        if (func)
++            errs() << " (" << func->getName() << ")";
++        errs() << "\n";
++    }
++    while(worklist.size()) {
++        Value *vv = worklist.front();
++        worklist.pop_front();
++        if (visited.count(vv))
++            continue;
++        visited.insert(vv);
++
++        if (isa<Instruction>(vv) &&
++            (cast<Instruction>(vv)->getParent() != nullptr)) {
++            if (func) {
++                if (cast<Instruction>(vv)->getFunction() != func)
++                    continue;
++            }
++
++            if (debug)
++                errs() << "    - " << *vv << "\n";
++            iset.insert(cast<Instruction>(vv));
++            continue;
++        }
++        if (isa<ConstantVector>(vv)) {
++            if (debug) {
++                errs() << "constant vector \n\n";
++                VectorType *vt = cast<ConstantVector>(vv)->getType();
++                errs() << "  element type: " << *vt->getElementType() << "\n";
++                errs() << "  num element: " << vt->getArrayNumElements() << "\n";
++                for(auto uu : vv->users())
++                    errs() << "  user  : "<< *uu << "\n";
++            }
++            auto uu = *vv->users().begin();
++            if (auto ii = dyn_cast<Instruction>(uu)) {
++                if (!ii->getParent())
++                    continue;
++                if (debug)
++                    errs() << "    - " << *ii << "\n";
++                iset.insert(ii);
++                continue;
++            }
++        }
++        for (auto uu : vv->users()) {
++            worklist.push_back(uu);
++        }
++    }
++
++    if (iset.empty()) {
++        if (debug)
++            errs() << "[ERROR] no iset!\n";
++        return nullptr;
++    }
++    return new InstructionSet(iset);
++}
++bool detach_constant_expr_recur(ConstantExpr *ce, Value *new_ce,
++                                Instruction *base, CE2FISet &ce2fimap) {
++    bool res = false;
++    bool debug = false;
++    //if (debug)
++        //print_debug(base, base->getFunction(), "detach_recursive");
++        //print_debug(new_ce);
++    for (int i=0; i<base->getNumOperands(); ++i) {
++        Value *op = base->getOperand(i);
++        if (!isa<ConstantExpr>(op)) {
++            continue;
++        }
++        ValueSet visited;
++        visited.clear();
++        if (op == ce) {
++            //print_debug(op, base->getFunction(), "detach_recur set op");
++            base->setOperand(i, new_ce);
++            res |= true;
++            //errs() << "\n~~ DEBUG ~~\n";
++            //errs() << *base->getParent() << "\n";
++            continue;
++        }
++
++        if (!is_use_def_recur(cast<User>(op), ce, &visited)) {
++            continue;
++        }
++        //print_debug(op, base->getFunction(), "detach_recur set op");
++
++        Function2ChkInst *fimap = nullptr;
++        InstructionSet *users = nullptr;
++        if (ce2fimap.count(cast<ConstantExpr>(op))) {
++            fimap =  ce2fimap[cast<ConstantExpr>(op)];
++            if (fimap) {
++                for (auto m : *fimap) {
++                    if (m.first == base->getFunction()) {
++                        users = m.second;
++                    }
++                }
++            }
++        }
++        if (!fimap) {
++            fimap = new Function2ChkInst;
++            ce2fimap[cast<ConstantExpr>(op)] = fimap;
++        }
++        if (!users) {
++            users = new InstructionSet;
++            fimap->insert(std::make_pair(base->getFunction(), users));
++        }
++
++        InstructionSet *new_set = ce2fi_new[cast<ConstantExpr>(op)];
++        if (!new_set) {
++            new_set = new InstructionSet;
++            ce2fi_new[cast<ConstantExpr>(op)] = new_set;
++        }
++
++        bool has_new = false;
++        for (auto ii : *new_set) {
++            if (ii->getParent() == base->getParent()) {
++                base->setOperand(i, ii);
++                has_new |= true;
++                break;
++            }
++        }
++        if (has_new)
++            continue;
++
++        IRBuilder<> builder(cast<Instruction>(new_ce)->getNextNode());
++        Value *nv =
++            builder.Insert(cast<ConstantExpr>(op)->getAsInstruction());
++        base->setOperand(i, nv);
++        users->insert(base);
++        new_set->insert(cast<Instruction>(nv));
++        //errs() << "\n~~ DEBUG ~~\n";
++        //errs() << *base->getParent() << "\n";
++
++        res |= detach_constant_expr_recur(
++            ce, new_ce, cast<Instruction>(nv), ce2fimap);
++    }
++    return res;
++}
++
++// detach constantexpr & return the list of users
++// NOTE: constant expr used in different instructions should be
++//  detached for each.
++// TODO: detach can be done on 1-level ce?
++InstructionSet *detach_constant_expr(ConstantExpr *ce, Function *func,
++                                     CE2FISet &ce2fimap) {
++    Function2ChkInst *fimap = nullptr;
++    InstructionSet *users = nullptr;
++    // check if ce is already detached in this function.
++    if (ce2fimap.count(ce)) {
++        fimap = ce2fimap[ce];
++        if (fimap) {
++            for (auto m : *fimap) {
++                if (m.first == func) {
++                    if (m.second) {
++                        users = m.second;
++                        if (users->size()>0) {
++                            return users;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    if (!fimap) {
++        fimap = new Function2ChkInst;
++        ce2fimap[ce] = fimap;
++    }
++    if (!users) {
++        users = new InstructionSet;
++        fimap->insert(std::make_pair(func, users));
++    }
++    InstructionSet *iset = get_inst(ce, false, func);
++    if (!iset) {
++        print_error(ce, func, "can't get iset from ce!");
++        return nullptr;
++    }
++    if (iset->empty()) {
++        print_error(ce, func, "can't get iset from ce!");
++        return nullptr;
++    }
++
++    InstructionSet *new_set = ce2fi_new[ce];
++    if (!new_set) {
++        new_set = new InstructionSet;
++        ce2fi_new[ce] = new_set;
++    }
++
++    bool debug = false;
++    //print_debug(ce, func, "detach constant expr");
++    InstructionSet expandSet;
++    for (auto insert : *iset) {
++        bool has_new = false;
++        for (auto ni :*users) {
++            if (ni->getParent() == insert->getParent()) {
++                has_new = true;
++                break;
++            }
++        }
++        if (has_new)
++            continue;
++
++        // create a new constantexpr for each basic block.
++        Instruction *ceI = cast<ConstantExpr>(ce)->getAsInstruction();
++        IRBuilder<> builder(insert);
++        builder.SetInsertPoint(&*insert->getParent()->getFirstInsertionPt());
++        Value *vv = builder.Insert(ceI);
++        users->insert(cast<Instruction>(vv));
++        new_set->insert(cast<Instruction>(vv));
++    }
++
++    InstructionSet userset;
++
++    for (auto insert : *iset) {
++        bool direct = false;
++        for (int i=0; i<insert->getNumOperands(); ++i)
++            if (insert->getOperand(i) == ce)
++                direct = true;
++        if (direct){
++            userset.insert(insert);
++        }
++        else {
++            expandSet.insert(insert);
++        }
++    }
++    delete iset;
++
++    for (auto ii : userset) {
++        Value *new_ce = nullptr;
++        for (auto ni : *users) {
++            if (ni->getParent() == ii->getParent()) {
++                new_ce = ni;
++                break;
++            }
++        }
++        if (!new_ce)
++            //should never happen
++            continue;
++
++        for (int i=0; i<ii->getNumOperands(); ++i)
++            if (ii->getOperand(i) == ce)
++                ii->setOperand(i, new_ce);
++    }
++
++    // now expand instructions in expandset
++    // : should detach all constantexpr chains
++
++    for (auto ei : expandSet) {
++        Value *new_ce = nullptr;
++        for (auto ni : *new_set) {
++            if (ni->getParent() == ei->getParent()) {
++                new_ce = ni;
++                break;
++            }
++        }
++        if (!new_ce)
++            // should not happen
++            continue;
++        if (detach_constant_expr_recur(ce, new_ce, ei, ce2fimap))
++            users->insert(ei);
++    }
++
++    if (debug)
++        errs() <<"~~~~~ DEBUG ~~~~~" << *func << "\n";
++
++    return users;
++}
++
++
++bool is_err_ptr(Value *v) {
++  if (!isa<CastInst>(v))
++    return false;
++
++  // %0 = %struct.A* <- [op]
++  // %1 = icmp ugt %0, inttoptr (i64 -err to %struct.A)
++  // br %1, label trueBB, label falseBB
++  //
++  // falseBB:
++  // %2 = bitcast %struct.A* %0 to %struct.B* <- [v]
++  auto op = cast<User>(v)->getOperand(0);
++  if (isa<Instruction>(op)) {
++    auto prevBB = cast<Instruction>(op)->getParent();
++    auto currBB = cast<Instruction>(v)->getParent();
++    if (prevBB!=currBB) {
++      if (auto br = dyn_cast<BranchInst>(prevBB->getTerminator())) {
++        if (br->isConditional()) {
++          if (auto icmp = dyn_cast<ICmpInst>(br->getOperand(0))) {
++            if (auto ce = dyn_cast<ConstantExpr>(icmp->getOperand(1))) {
++              if (ce->getOpcode() == Instruction::IntToPtr)
++                return true;
++            }
++          }
++        }
++      }
++    }
++  }
++  // %0 = %struct.A*
++  // %1 = bitcast %struct.A* %0 to %struct.B* <- [v]
++  // %2 = icmp ugt %0, inttoptr (i64 -err to %struct.A*)
++  // br %2, label trueBB, label falseBB
++  for (auto u : op->users()) {
++    if (auto icmp = dyn_cast<ICmpInst>(u)) {
++      if (auto ce = dyn_cast<ConstantExpr>(icmp->getOperand(1))) {
++        if (ce->getOpcode() == Instruction::IntToPtr)
++          return true;
++      }
++    }
++  }
++
++  return false;
++}
++
+diff --git a/llvm/lib/Transforms/Instrumentation/PPACUtility.h b/llvm/lib/Transforms/Instrumentation/PPACUtility.h
+new file mode 100644
+index 000000000..4a4a6617b
+--- /dev/null
++++ b/llvm/lib/Transforms/Instrumentation/PPACUtility.h
+@@ -0,0 +1,253 @@
++#ifndef __PPACUTILITY_H_
++#define __PPACUTILITY_H_
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Operator.h"
++#include "llvm/IR/Value.h"
++#include "llvm/IR/Use.h"
++#include "llvm/IR/Type.h"
++#include "llvm/IR/Instruction.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Constant.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/GlobalValue.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/InstrTypes.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/Intrinsics.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Metadata.h"
++#include "llvm/IR/Type.h"
++#include "llvm/IR/Use.h"
++#include "llvm/IR/InlineAsm.h"
++
++#include <string>
++#include <list>
++#include <map>
++#include <set>
++#include <unordered_map>
++#include <unordered_set>
++using namespace llvm;
++typedef std::list<std::string> StringList;
++typedef std::unordered_set<std::string> StringSet;
++typedef std::list<Value*> ValueList;
++typedef std::list<Use*> UseList;
++typedef std::unordered_set<Value*> ValueSet;
++typedef std::unordered_set<Use*> UseSet;
++typedef std::unordered_set<User*> UserSet;
++typedef std::unordered_set<Instruction*> InstructionSet;
++typedef std::list <Instruction*> InstructionList;                    
++typedef std::unordered_set<Type*> TypeSet;
++typedef std::unordered_set<Function*> FunctionSet;
++
++typedef std::list<int> Indices;
++typedef std::unordered_set<int> intSet;
++typedef std::unordered_set<ValueList*> VLSet;
++typedef std::unordered_map<Instruction*, VLSet*> Inst2Uselists;
++typedef std::unordered_map<Value*, InstructionSet*> Value2ChkInst;
++typedef std::unordered_map<Instruction*, Function*> InstFuncMap;
++typedef std::unordered_map<Function*, InstructionSet*> Function2ChkInst;
++typedef std::unordered_map<ConstantExpr*, Function2ChkInst*> CE2FISet;
++typedef std::unordered_map<ConstantExpr*, InstructionSet*> CE2Inst;
++typedef std::pair<Instruction*, int> InstInt;
++typedef std::unordered_set<InstInt*> InstIntSet;
++typedef std::unordered_map<Instruction*, int> Inst2Int;
++typedef std::unordered_map<Value*, Instruction*> Value2Inst;
++typedef std::unordered_map<Value*, InstructionSet*> Value2InstSet;
++typedef std::unordered_map<std::string, Function*> FunctionNameMap;
++typedef std::unordered_map<Instruction*, intSet*> Inst2intSet; 
++static CE2Inst ce2fi_new;
++
++bool is_same_uselist(ValueList* vl0, ValueList *vl1);
++bool preserve_pac(Instruction *ii, InstructionSet *visited);
++        
++Instruction *current_from_cred(Value *cred_load);
++bool is_asm(Value*);
++bool is_asm_get_current(Value*);
++bool is_asm_load(Value*, int op=-1);
++bool is_asm_store(Value*, int op=-1);
++bool is_asm_access(Value*, int);
++int get_asm_addr(Value*);
++int get_asm_ldval(Value*);
++int get_asm_stval(Value*);
++bool is_asm_jump(Value*v);
++bool is_global(Value *v, ValueSet *gvset, std::set<unsigned> *skipset=nullptr);
++
++// ppac instrument classes
++class create {
++public:
++    Function *func;
++    Value *src;
++    Value *dest;
++    int code;
++
++    bool is_same(create *cr) {
++        if (func != cr->func)
++            return false;
++        if (src != cr->src)
++            return false;
++        if (dest != cr->src)
++            return false;
++        // FIXME
++        if (code != cr->code)
++            return false;
++        return true;
++    }
++};
++
++class check {
++public:
++    Function *func;
++    Value *base;
++    int opNum;
++    int code;
++    ValueList *ul;
++    Value *codeV;
++    bool is_same(check *ch) {
++        if (func != ch->func)
++            return false;
++        if (base != ch->base)
++            return false;
++        if (opNum != ch->opNum) {
++            //errs() << "different opNum: " << opNum;
++            //errs() << " vs. " << ch->opNum << "\n";
++            return false;
++        }
++        // FIXME
++        if (code != ch->code) {
++            //errs() << "different code: " << code;
++            //errs() << " vs. " << ch->code << "\n";
++            return false;
++        }
++
++        if (!is_same_uselist(ul, ch->ul)) {
++            return false;
++        }
++        return true;
++    }
++};
++
++class copy {
++public:
++    Function *func;
++    Value *base;
++    int opNum;
++};
++
++class convert {
++public:
++    Function *func;
++    Instruction *base;
++    int opNum;
++    int code;
++    VLSet *ulset;
++    bool is_same(convert *cv) {
++        if (func != cv->func)
++            return false;
++        if (base != cv->base)
++            return false;
++        if (opNum != cv->opNum)
++            return false;
++        // FIXME
++        if (code != cv->code)
++            return false;
++
++        if (ulset->size() != cv->ulset->size())
++            return false;
++        auto it0 = ulset->begin();
++        auto it1 = cv->ulset->begin();
++        for (; it0 != ulset->end(); ++it0, ++it1) {
++            if (!is_same_uselist(*it0, *it1))
++                return false;
++        }
++        return true;
++    }
++};
++
++class strip {
++public:
++    Function *func;
++    User *base;
++    int opNum;
++    bool is_same(strip *st) {
++        if (func != st->func)
++            return false;
++        if (base != st->base)
++            return false;
++        if (opNum != st->opNum)
++            return false;
++        return true;
++    }
++};
++
++class mte {
++public:
++    Function *func;
++    Instruction *base;
++    int opNum;
++    int tag;
++    VLSet *ulset;
++    bool is_same(mte *m) {
++        if (func != m->func)
++            return false;
++        if (base != m->base)
++            return false;
++        if (opNum != m->opNum)
++            return false;
++        if (tag != m->tag)
++            return false;
++
++        if (ulset->size() != m->ulset->size())
++            return false;
++        auto it0 = ulset->begin();
++        auto it1 = m->ulset->begin();
++        for (; it0 != ulset->end(); ++it0, ++it1) {
++            if (!is_same_uselist(*it0, *it1))
++                return false;
++        }
++        return true;
++    }
++};
++
++typedef std::unordered_set<check*> checkDump;
++typedef std::unordered_set<create*> createDump;
++typedef std::unordered_set<convert*> convertDump;
++typedef std::unordered_set<strip*> stripDump;
++typedef std::unordered_set<mte*> mteDump;
++typedef std::list<mte*> mtelist;
++
++StructType *get_pstr_type(Value*);
++StructType *get_pstr_type(Type*);
++Type *get_parr_type(Type*);
++StructType *get_cast_pstr_type(Value*);
++
++void print_error(StringRef v, Function *func, StringRef msg);
++void print_report(StringRef v, Function *func, StringRef msg);
++void print_debug(StringRef v, Function *func = nullptr, StringRef msg = "");
++void print_error(Value *v, Function *func, StringRef msg);
++void print_report(Value *v, Function *func, StringRef msg);
++void print_debug(Value *v, Function *func, StringRef msg);
++void print_error(Type *v, Function *func, StringRef msg);
++void print_report(Type *v, Function *func, StringRef msg);
++void print_debug(Type *v, Function *func, StringRef msg);
++void print_debug(Value *v, StringRef msg);
++
++std::string get_struct_name(std::string tname);
++Function* get_callee_function_direct(Instruction* i);
++StringRef get_callee_function_name(Instruction* i);
++bool is_use_def(User *u, Value *d);
++bool is_use_def_recur(User*u, Value*d, ValueSet *visited);
++InstructionSet *get_inst(Value *v, bool debug, Function* func);
++bool detach_constant_expr_recur(ConstantExpr *ce, Value *new_ce,
++                                Instruction *base, CE2FISet &ce2fimap);
++InstructionSet *detach_constant_expr(ConstantExpr *ce, Function *func,
++                                     CE2FISet &ce2fimap);
++bool is_err_ptr(Value *v);
++bool is_builtin_container_of(Value *v);
++
++#endif // __PPACUTILITY_H_

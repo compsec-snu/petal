@@ -1,0 +1,2237 @@
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index 448a575db..a39e82349 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -295,6 +295,48 @@ alternative_endif
+ 	ldr	\dst, [\dst, \tmp]
+ 	.endm
+ 
++	.macro ldr_this_cpu_aut_nop dst, sym, tmp1, tmp2, tmp3
++	adr_l	\dst, \sym
++	get_this_cpu_offset \tmp1
++	ldr	\dst, [\dst, \tmp1]
++	.endm
++
++	.macro ldr_this_cpu_pseudo dst, sym, tmp1, tmp2, tmp3
++	adr_l	\dst, \sym
++alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
++	mrs	\tmp1, tpidr_el1
++alternative_else
++	mrs	\tmp1, tpidr_el2
++alternative_endif
++	add \tmp2, \dst, \tmp1
++	ldr	\dst, [\tmp2]
++
++	// \tmp1 mapped to \x19
++
++	eor \tmp2, \dst, \tmp2
++	ubfx \tmp2, \tmp2, 8, 8
++	lsl \tmp3, \tmp2, 48
++	cmp \tmp2, 0xff
++	eor \tmp3, \tmp3, 0xff000000000000
++	mov \tmp2, 0x0f000000000000
++	csel \tmp1, \tmp2, \tmp3, eq
++	eor \dst, \dst, \tmp1
++	.endm
++
++	.macro ldr_this_cpu_aut dst, sym, tmp1, tmp2, tmp3
++	adr_l	\dst, \sym
++alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
++	mrs	\tmp1, tpidr_el1
++alternative_else
++	mrs	\tmp1, tpidr_el2
++alternative_endif
++	add \tmp2, \dst, \tmp1
++	ldr	\dst, [\tmp2]
++
++	orr \dst, \dst, 0x007fff8000000000
++	.endm
++
++
+ /*
+  * vma_vm_mm - get mm pointer from vma pointer (vma->vm_mm)
+  */
+diff --git a/arch/arm64/include/asm/atomic_ll_sc.h b/arch/arm64/include/asm/atomic_ll_sc.h
+index abd302e52..db685a8d3 100644
+--- a/arch/arm64/include/asm/atomic_ll_sc.h
++++ b/arch/arm64/include/asm/atomic_ll_sc.h
+@@ -253,7 +253,7 @@ __ll_sc__cmpxchg_case_##name##sz(volatile void *ptr,			\
+ 	if (sz < 32)							\
+ 		old = (u##sz)old;					\
+ 									\
+-	asm volatile(							\
++	asm volatile(	"// cmpxchg_case\n"						\
+ 	"	prfm	pstl1strm, %[v]\n"				\
+ 	"1:	ld" #acq "xr" #sfx "\t%" #w "[oldval], %[v]\n"		\
+ 	"	eor	%" #w "[tmp], %" #w "[oldval], %" #w "[old]\n"	\
+diff --git a/arch/arm64/include/asm/atomic_lse.h b/arch/arm64/include/asm/atomic_lse.h
+index 28e96118c..9063fc1af 100644
+--- a/arch/arm64/include/asm/atomic_lse.h
++++ b/arch/arm64/include/asm/atomic_lse.h
+@@ -348,7 +348,7 @@ __lse__cmpxchg_case_##name##sz(volatile void *ptr,			\
+ 	register u##sz x2 asm ("x2") = new;				\
+ 	unsigned long tmp;						\
+ 									\
+-	asm volatile(							\
++	asm volatile("// cmpxchg_case\n"						\
+ 	__LSE_PREAMBLE							\
+ 	"	mov	%" #w "[tmp], %" #w "[old]\n"			\
+ 	"	cas" #mb #sfx "\t%" #w "[tmp], %" #w "[new], %[v]\n"	\
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index 05886322c..085e4ccc4 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -217,19 +217,19 @@ static inline unsigned long kaslr_offset(void)
+ 
+ #define untagged_addr(addr)	({					\
+ 	u64 __addr = (__force u64)(addr);					\
+-	__addr &= __untagged_addr(__addr);				\
++	__addr = __untagged_addr(__addr);				\
+ 	(__force __typeof__(addr))__addr;				\
+ })
+ 
+-#if defined(CONFIG_KASAN_SW_TAGS) || defined(CONFIG_KASAN_HW_TAGS)
++//#if defined(CONFIG_KASAN_SW_TAGS) || defined(CONFIG_KASAN_HW_TAGS)
+ #define __tag_shifted(tag)	((u64)(tag) << 56)
+ #define __tag_reset(addr)	__untagged_addr(addr)
+ #define __tag_get(addr)		(__u8)((u64)(addr) >> 56)
+-#else
+-#define __tag_shifted(tag)	0UL
+-#define __tag_reset(addr)	(addr)
+-#define __tag_get(addr)		0
+-#endif /* CONFIG_KASAN_SW_TAGS || CONFIG_KASAN_HW_TAGS */
++//#else
++//#define __tag_shifted(tag)	0UL
++//#define __tag_reset(addr)	(addr)
++//#define __tag_get(addr)		0
++//#endif /* CONFIG_KASAN_SW_TAGS || CONFIG_KASAN_HW_TAGS */
+ 
+ static inline const void *__tag_set(const void *addr, u8 tag)
+ {
+diff --git a/arch/arm64/include/asm/mte-kasan.h b/arch/arm64/include/asm/mte-kasan.h
+index 592aabb25..c3814e459 100644
+--- a/arch/arm64/include/asm/mte-kasan.h
++++ b/arch/arm64/include/asm/mte-kasan.h
+@@ -138,7 +138,11 @@ void mte_enable_kernel_async(void);
+ 
+ static inline u8 mte_get_ptr_tag(void *ptr)
+ {
+-	return 0xFF;
++
++  /* Note: The format of KASAN tags is 0xF<x> */
++	u8 tag = 0xF0 | (u8)(((u64)(ptr)) >> MTE_TAG_SHIFT);
++
++	return tag;
+ }
+ 
+ static inline u8 mte_get_mem_tag(void *addr)
+diff --git a/arch/arm64/include/asm/mte.h b/arch/arm64/include/asm/mte.h
+index 3e368ca66..c5413967a 100644
+--- a/arch/arm64/include/asm/mte.h
++++ b/arch/arm64/include/asm/mte.h
+@@ -11,7 +11,9 @@
+ #ifndef __ASSEMBLY__
+ 
+ #include <linux/bitfield.h>
++//#include <linux/kasan-enabled.h>
+ #include <linux/page-flags.h>
++#include <linux/sched.h>
+ #include <linux/types.h>
+ 
+ #include <asm/pgtable-types.h>
+@@ -29,6 +31,7 @@ void mte_invalidate_tags(int type, pgoff_t offset);
+ void mte_invalidate_tags_area(int type);
+ void *mte_allocate_tag_storage(void);
+ void mte_free_tag_storage(char *storage);
++void mte_enable_kernel_sync(void);
+ 
+ #ifdef CONFIG_ARM64_MTE
+ 
+@@ -48,6 +51,7 @@ long get_mte_ctrl(struct task_struct *task);
+ int mte_ptrace_copy_tags(struct task_struct *child, long request,
+ 			 unsigned long addr, unsigned long data);
+ 
++
+ #else /* CONFIG_ARM64_MTE */
+ 
+ /* unused if !CONFIG_ARM64_MTE, silence the compiler */
+@@ -88,9 +92,28 @@ static inline int mte_ptrace_copy_tags(struct task_struct *child,
+ {
+ 	return -EIO;
+ }
+-
+ #endif /* CONFIG_ARM64_MTE */
+ 
++static inline void mte_disable_tco_entry(struct task_struct *task)
++{
++	if (!system_supports_mte()) {
++		return;
++  }
++	/*
++	 * Re-enable tag checking (TCO set on exception entry). This is only
++	 * necessary if MTE is enabled in either the kernel or the userspace
++	 * task in synchronous or asymmetric mode (SCTLR_EL1.TCF0 bit 0 is set
++	 * for both). With MTE disabled in the kernel and disabled or
++	 * asynchronous in userspace, tag check faults (including in uaccesses)
++	 * are not reported, therefore there is no need to re-enable checking.
++	 * This is beneficial on microarchitectures where re-enabling TCO is
++	 * expensive.
++	 */
++	//if (kasan_hw_tags_enabled() ||
++	//    (task->thread.sctlr_user & (1UL << SCTLR_EL1_TCF0_SHIFT)))
++	asm volatile(SET_PSTATE_TCO(0));
++}
++
+ #ifdef CONFIG_KASAN_HW_TAGS
+ /* Whether the MTE asynchronous mode is enabled. */
+ DECLARE_STATIC_KEY_FALSE(mte_async_mode);
+diff --git a/arch/arm64/include/asm/pointer_auth.h b/arch/arm64/include/asm/pointer_auth.h
+index efb098de3..bb0d2b965 100644
+--- a/arch/arm64/include/asm/pointer_auth.h
++++ b/arch/arm64/include/asm/pointer_auth.h
+@@ -14,6 +14,41 @@
+ 	(PR_PAC_APIAKEY | PR_PAC_APIBKEY | PR_PAC_APDAKEY | PR_PAC_APDBKEY)
+ 
+ #ifdef CONFIG_ARM64_PTR_AUTH
++
++extern inline void *set_tag_n(const void *addr);
++extern inline void *set_tag_f(const void *addr);
++extern void *alloc_mte_percpu(void *addr, u64 size);
++//extern void *alloc_normal_percpu(void *addr, u64 size);
++extern inline void *alloc_mte(void *addr, u64 size);
++extern inline void *kmem_cache_mte(void *addr, void *slab);
++extern inline void *alloc_normal(void *addr, u64 size);
++extern inline void *ppac_create(void *addr, unsigned long long type);
++extern inline void *ppac_check(void *addr, unsigned long long type);
++extern inline void *ppac_strip(void *addr);
++extern void ppac_copy(void *dst, void *src, int size, int *idx, int idx_size);
++extern void *ppac_skip(void *ptr);
++extern void *ppac_load(void **ptr);
++extern void ppac_dump(void);
++
++extern void ppac_copy_all(void *dst, void *src, int size);
++
++extern void kdfi_mte_set_mem_tag_range(void *addr, size_t size, unsigned char tag);
++extern void kdfi_tag_globals(void);
++extern void kdfi_sign_globals(void);
++
++extern uint64_t pac_create_count;
++extern uint64_t pac_create_invalid_count;
++extern uint64_t pac_check_count;
++extern uint64_t pac_check_invalid_count;
++extern uint64_t pac_check_wrong_count;
++extern uint64_t pac_strip_count;
++extern uint64_t pac_strip_invalid_count;
++extern uint64_t mte_ptag_count;
++extern uint64_t mte_ntag_count;
++extern uint64_t mte_ftag_count;
++extern uint64_t normal_alloc_count;
++extern uint64_t mte_alloc_count;
++
+ /*
+  * Each key is a 128-bit quantity which is split across a pair of 64-bit
+  * registers (Lo and Hi).
+@@ -45,6 +80,7 @@ do {								\
+ 
+ struct ptrauth_keys_kernel {
+ 	struct ptrauth_key apia;
++  struct ptrauth_key apda;
+ };
+ 
+ static __always_inline void ptrauth_keys_init_kernel(struct ptrauth_keys_kernel *keys)
+@@ -59,16 +95,42 @@ static __always_inline void ptrauth_keys_switch_kernel(struct ptrauth_keys_kerne
+ 		return;
+ 
+ 	__ptrauth_key_install_nosync(APIA, keys->apia);
++  __ptrauth_key_install_nosync(APDA, keys->apda);
+ 	isb();
+ }
+ 
+ #endif /* CONFIG_ARM64_PTR_AUTH_KERNEL */
++void mte_set_tcma_noreturn(void);
++u64 mte_set_tcma(void);
++u64 mte_unset_tcma(void);
++void mte_recover_tcma(u64);
++void *set_tag_n(const void *addr);
++void *set_tag_f(const void *addr);
++void *alloc_mte_percpu(void *addr, u64 size);
++void *alloc_normal_percpu(void *addr, u64 size);
++void *alloc_mte(void *addr, u64 size);
++void *alloc_nomte(void *addr, u64 size);
++void *ppac_create(void *addr, unsigned long long type);
++void *ppac_check(void *addr, unsigned long long type);
++void *ppac_strip(void *addr);
++
++extern uint64_t paciasp_count;
++extern uint64_t autiasp_count;
++extern uint64_t normal_alloc_count;
++extern uint64_t mte_alloc_count;
++extern uint64_t pac_create_count;
++extern uint64_t pac_check_count;
++extern uint64_t pac_strip_count;
++extern uint64_t set_tcma_count;
++extern uint64_t mte_ntag_count;
++extern uint64_t mte_ftag_count;
++
+ 
+ static inline void ptrauth_keys_install_user(struct ptrauth_keys_user *keys)
+ {
+ 	if (system_supports_address_auth()) {
+ 		__ptrauth_key_install_nosync(APIB, keys->apib);
+-		__ptrauth_key_install_nosync(APDA, keys->apda);
++    //__ptrauth_key_install_nosync(APDA, keys->apda);
+ 		__ptrauth_key_install_nosync(APDB, keys->apdb);
+ 	}
+ 
+@@ -104,8 +166,8 @@ static inline unsigned long ptrauth_strip_insn_pac(unsigned long ptr)
+ 
+ static __always_inline void ptrauth_enable(void)
+ {
+-	if (!system_supports_address_auth())
+-		return;
++	//if (!system_supports_address_auth())
++	//	return;
+ 	sysreg_clear_set(sctlr_el1, 0, (SCTLR_ELx_ENIA | SCTLR_ELx_ENIB |
+ 					SCTLR_ELx_ENDA | SCTLR_ELx_ENDB));
+ 	isb();
+diff --git a/arch/arm64/include/asm/sysreg.h b/arch/arm64/include/asm/sysreg.h
+index 543eb08fa..f7c94e39f 100644
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -1104,7 +1104,7 @@
+ #define SYS_GCR_EL1_RRND	(BIT(16))
+ #define SYS_GCR_EL1_EXCL_MASK	0xffffUL
+ 
+-#ifdef CONFIG_KASAN_HW_TAGS
++//#ifdef CONFIG_KASAN_HW_TAGS
+ /*
+  * KASAN always uses a whole byte for its tags. With CONFIG_KASAN_HW_TAGS it
+  * only uses tags in the range 0xF0-0xFF, which we map to MTE tags 0x0-0xF.
+@@ -1113,9 +1113,9 @@
+ #define __MTE_TAG_MAX		(KASAN_TAG_MAX & 0xf)
+ #define __MTE_TAG_INCL		GENMASK(__MTE_TAG_MAX, __MTE_TAG_MIN)
+ #define KERNEL_GCR_EL1_EXCL	(SYS_GCR_EL1_EXCL_MASK & ~__MTE_TAG_INCL)
+-#else
+-#define KERNEL_GCR_EL1_EXCL	SYS_GCR_EL1_EXCL_MASK
+-#endif
++//#else
++//#define KERNEL_GCR_EL1_EXCL	SYS_GCR_EL1_EXCL_MASK
++//#endif
+ 
+ #define KERNEL_GCR_EL1		(SYS_GCR_EL1_RRND | KERNEL_GCR_EL1_EXCL)
+ 
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 749e31475..d95ec9c44 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -9,6 +9,7 @@ CFLAGS_REMOVE_ftrace.o = $(CC_FLAGS_FTRACE)
+ CFLAGS_REMOVE_insn.o = $(CC_FLAGS_FTRACE)
+ CFLAGS_REMOVE_return_address.o = $(CC_FLAGS_FTRACE)
+ 
++CFLAGS_REMOVE_idreg-override.o = -fsanitize=kdfi_instrument
+ # Remove stack protector to avoid triggering unneeded stack canary
+ # checks due to randomize_kstack_offset.
+ CFLAGS_REMOVE_syscall.o	 = -fstack-protector -fstack-protector-strong
+@@ -85,3 +86,5 @@ extra-y					+= $(head-y) vmlinux.lds
+ ifeq ($(CONFIG_DEBUG_EFI),y)
+ AFLAGS_head.o += -DVMLINUX_PATH="\"$(realpath $(objtree)/vmlinux)\""
+ endif
++
++#CONFIG_idreg-override.o := $(filter-out -fsanitize=kdfi_instrument, $(CONFIG_idreg-override.o))
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index f17d6cdea..9c110e52c 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -84,6 +84,7 @@
+ #include <asm/kvm_host.h>
+ #include <asm/mmu_context.h>
+ #include <asm/mte.h>
++#include <asm/mte-kasan.h>
+ #include <asm/processor.h>
+ #include <asm/smp.h>
+ #include <asm/sysreg.h>
+@@ -1914,6 +1915,9 @@ static void cpu_enable_mte(struct arm64_cpu_capabilities const *cap)
+ 		mte_clear_page_tags(lm_alias(empty_zero_page));
+ 
+ 	kasan_init_hw_tags_cpu();
++  mte_set_tcma();
++  mte_enable_kernel_sync();
++  pr_info("[JH] cpu_enable_mte\n");
+ }
+ #endif /* CONFIG_ARM64_MTE */
+ 
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index 864423297..3ab797fc7 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/context_tracking.h>
++#include <linux/kasan.h>
+ #include <linux/linkage.h>
+ #include <linux/lockdep.h>
+ #include <linux/ptrace.h>
+@@ -55,6 +56,7 @@ static void noinstr enter_from_kernel_mode(struct pt_regs *regs)
+ {
+ 	__enter_from_kernel_mode(regs);
+ 	mte_check_tfsr_entry();
++	mte_disable_tco_entry(current);
+ }
+ 
+ /*
+@@ -102,6 +104,7 @@ static __always_inline void __enter_from_user_mode(void)
+ 	CT_WARN_ON(ct_state() != CONTEXT_USER);
+ 	user_exit_irqoff();
+ 	trace_hardirqs_off_finish();
++	mte_disable_tco_entry(current);
+ }
+ 
+ static __always_inline void enter_from_user_mode(struct pt_regs *regs)
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index bdc5f7442..4a50a28d7 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -174,14 +174,14 @@ alternative_else_nop_endif
+ 	.endm
+ 
+ 	.macro mte_set_kernel_gcr, tmp, tmp2
+-#ifdef CONFIG_KASAN_HW_TAGS
+-alternative_if_not ARM64_MTE
+-	b	1f
+-alternative_else_nop_endif
++//#ifdef CONFIG_KASAN_HW_TAGS
++//alternative_if_not ARM64_MTE
++//	b	1f
++//alternative_else_nop_endif
+ 	mov	\tmp, KERNEL_GCR_EL1
+ 	msr_s	SYS_GCR_EL1, \tmp
+-1:
+-#endif
++//1:
++//#endif
+ 	.endm
+ 
+ 	.macro mte_set_user_gcr, tsk, tmp, tmp2
+@@ -219,7 +219,7 @@ alternative_else_nop_endif
+ 	.if	\el == 0
+ 	clear_gp_regs
+ 	mrs	x21, sp_el0
+-	ldr_this_cpu	tsk, __entry_task, x20
++	ldr_this_cpu_aut	tsk, __entry_task, x10, x20, x18
+ 	msr	sp_el0, tsk
+ 
+ 	/*
+@@ -315,13 +315,6 @@ alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+ 	msr_s	SYS_ICC_PMR_EL1, x20
+ alternative_else_nop_endif
+ 
+-	/* Re-enable tag checking (TCO set on exception entry) */
+-#ifdef CONFIG_ARM64_MTE
+-alternative_if ARM64_MTE
+-	SET_PSTATE_TCO(0)
+-alternative_else_nop_endif
+-#endif
+-
+ 	/*
+ 	 * Registers that may be useful after this macro is invoked:
+ 	 *
+@@ -1042,7 +1035,7 @@ SYM_CODE_START(__sdei_asm_handler)
+ 	 * return-to either of these. We can't trust sp_el0, restore it.
+ 	 */
+ 	mrs	x28, sp_el0
+-	ldr_this_cpu	dst=x0, sym=__entry_task, tmp=x1
++	ldr_this_cpu_aut	dst=x0, sym=__entry_task, tmp=x1, tmp2=x2, tmp3=x6
+ 	msr	sp_el0, x0
+ 
+ 	/* If we interrupted the kernel point to the previous stack/frame. */
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 512a921ed..afc0af0e1 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -651,6 +651,7 @@ SYM_FUNC_START_LOCAL(__secondary_switched)
+ 	adr_l	x0, secondary_data
+ 	ldr	x2, [x0, #CPU_BOOT_TASK]
+ 	cbz	x2, __secondary_too_slow
++  orr x2, x2, 0x007fff8000000000 // JH: skip pac auth
+ 
+ 	init_cpu_task x2, x1, x3
+ 
+diff --git a/arch/arm64/kernel/mte.c b/arch/arm64/kernel/mte.c
+index a3898bac5..97e3ec092 100644
+--- a/arch/arm64/kernel/mte.c
++++ b/arch/arm64/kernel/mte.c
+@@ -117,7 +117,6 @@ static inline void __mte_enable_kernel(const char *mode, unsigned long tcf)
+ 	pr_info_once("MTE: enabled in %s mode at EL1\n", mode);
+ }
+ 
+-#ifdef CONFIG_KASAN_HW_TAGS
+ void mte_enable_kernel_sync(void)
+ {
+ 	/*
+@@ -129,7 +128,9 @@ void mte_enable_kernel_sync(void)
+ 
+ 	__mte_enable_kernel("synchronous", SCTLR_ELx_TCF_SYNC);
+ }
++EXPORT_SYMBOL(mte_enable_kernel_sync);
+ 
++#ifdef CONFIG_KASAN_HW_TAGS
+ void mte_enable_kernel_async(void)
+ {
+ 	__mte_enable_kernel("asynchronous", SCTLR_ELx_TCF_ASYNC);
+@@ -206,6 +207,7 @@ void mte_thread_switch(struct task_struct *next)
+ 		return;
+ 
+ 	mte_update_sctlr_user(next);
++  mte_disable_tco_entry(next);
+ 
+ 	/*
+ 	 * Check if an async tag exception occurred at EL1.
+diff --git a/arch/arm64/kernel/pointer_auth.c b/arch/arm64/kernel/pointer_auth.c
+index 2708b620b..0c38ed0da 100644
+--- a/arch/arm64/kernel/pointer_auth.c
++++ b/arch/arm64/kernel/pointer_auth.c
+@@ -7,6 +7,308 @@
+ #include <linux/sched.h>
+ #include <asm/cpufeature.h>
+ #include <asm/pointer_auth.h>
++#include <linux/memblock.h>
++#include <asm/stacktrace.h>
++
++// We emulate ARMv8.5 FPAC by authenticating pointers using pacda, instead of autda,
++// and manually calling panic if the pointer does not contain the expected PAC.
++// This allows for synchronously raising PAC authentication failure at the authentication time, 
++// not the memory access time.
++// We note that this implementation is for testing (using qemu 5.1.0),
++// and implementation for devices up to ARMv8.5 (e.g., pixel 8) can be modified to use autda.
++
++int debug_petal=1;
++
++inline void *set_tag_f(const void *addr) {
++    void *tagged = (void *)addr;
++    int shl = (unsigned long long) addr >> 4*11;
++    if (shl < 0xf0000 || (shl == 0xfffff))
++        return tagged;
++
++    tagged = (void *) (((unsigned long long) (tagged)) | 0xff00000000000000);
++    return tagged;
++}
++EXPORT_SYMBOL(set_tag_f);
++
++
++u64 mte_set_tcma(void) {
++	u64 tcr = read_sysreg(tcr_el1);
++	write_sysreg(tcr | TCR_TCMA1 | TCR_TCMA0, tcr_el1);
++	return tcr;
++}
++EXPORT_SYMBOL(mte_set_tcma);
++#ifdef CONFIG_ARM64_PTR_AUTH
++static inline int is_valid_addr(unsigned long addr) {
++	
++  if ((addr >=  0xffffff8000000000) && 
++		(addr < 0xffffff8080000000) /* End of kernel mapping*/) {
++		return 1;
++	}
++	
++  return 0;
++}
++
++inline void *ppac_create(void *addr, unsigned long long type) {
++    void *encode;
++	unsigned long _addr = __tag_reset((unsigned long)addr);
++
++    if (!is_valid_addr(_addr)) {
++      return addr;
++    }
++
++    asm volatile(".arch armv8.3a\n" \
++				".arch_extension pauth\n" \
++				"pacda %0, %2"                \
++              : "=&r" (encode)                   \
++                 :"0" (addr), "r" ((unsigned long)type));
++
++    return encode;
++}
++EXPORT_SYMBOL(ppac_create);
++ 
++
++inline void *ppac_check(void *addr, unsigned long long type) {
++  void *decode;
++  void *pc;
++  unsigned long _addr = (unsigned long)addr;
++  // remove PAC
++  asm volatile(".arch armv8.3a\n" \
++				       ".arch_extension pauth\n" \
++				       "xpacd %0"                \
++                 : "=&r" (_addr)         \
++                 :"0" (_addr)); 
++
++  if (!is_valid_addr(__tag_reset(_addr)))
++    return addr; 
++
++  asm volatile(".arch armv8.3a\n" \
++				      ".arch_extension pauth\n" \
++				      "pacda %0, %2"            \
++              : "=&r" (decode)          \
++                 :"0" (_addr), "r" ((unsigned long)type));
++
++  if (addr != decode) {
++	  if (debug_petal) {
++	  	pr_info("ppac_check wrong!: %llx (%llx) should be (%llx)\n", addr, type, decode);
++      	pc = __builtin_return_address(0);
++      	pr_info("func: %llx (%ps)\n", pc, pc);
++      	dump_backtrace(NULL, current, KERN_DEFAULT);
++	  } else {
++      panic("ppac_check wrong!");
++    }
++  }
++  decode = (void*)_addr;
++
++  return decode;
++}
++EXPORT_SYMBOL(ppac_check);
++ 
++inline void *ppac_strip(void *addr) {
++    void *strip = addr;
++
++    if ((u64)addr < 0xf000000000000000) {
++        return addr;
++    }
++    asm volatile(".arch armv8.3a\n" \
++				         ".arch_extension pauth\n" \
++				         "xpacd %0"                \
++                 : "=&r" (strip)           \
++                 :"0" (strip));
++ 
++    return strip;
++}
++EXPORT_SYMBOL(ppac_strip);
++
++void ppac_copy(void *dst, void *src, int size, int *idx, int idx_size) {
++  int i;
++  void *pc;
++  if (size <= 0)
++      return;
++  for (i=0; i < idx_size; ++i) {
++	  unsigned long _addr;
++    void *ptr, *auth, *sign;
++    u64 pptr_dst, pptr_src;
++    int offset;
++    offset = idx[i];
++
++    if (size < offset+8)
++      continue;
++
++    pptr_dst = (u64)dst + offset;
++    pptr_src = (u64)src + offset;
++    ptr = *(void**)pptr_src;
++
++	  _addr = (unsigned long)ptr;
++	  // remove PAC
++	  asm volatile(".arch armv8.3a\n" \
++	  			".arch_extension pauth\n" \
++	  			"xpacd %0"                   \
++                   : "=&r" (_addr)             \
++                   :"0" (_addr)); 
++
++	  if (!is_valid_addr(__tag_reset(_addr)))
++	  	continue;
++
++	  asm volatile(".arch armv8.3a\n" \
++	  			".arch_extension pauth\n" \
++	  			"pacda %0, %2"                \
++                : "=&r" (auth)                   \
++                   :"0" (_addr), "r" ((unsigned long)pptr_src));
++
++    if (ptr != auth) {
++		  if (debug_petal) {
++		  	pr_info("ppac_copy mismatch: %llx (%llx) should be %llx\n", ptr, pptr_src, auth);
++        		pc = __builtin_return_address(0);
++        		pr_info("func: %llx (%ps)\n", pc, pc);
++        		dump_backtrace(NULL, current, KERN_DEFAULT);
++		  } else {
++        panic("ppac_copy mismatch!");
++      }
++    }
++	  auth = (void*)_addr;
++    
++    asm volatile(".arch armv8.3a\n" \
++				".arch_extension pauth\n" \
++				"pacda %0, %2"                \
++            : "=&r" (sign)                   \
++               :"0" (auth), "r" ((unsigned long)pptr_dst));
++
++    *(void**)pptr_dst = sign;
++  }
++  return;
++}
++EXPORT_SYMBOL(ppac_copy);
++
++void ppac_copy_all(void *dst, void *src, int size) {
++  int offset;
++  void *pc;
++  if (size <= 0)
++      return;
++
++  for (offset=0; offset < size; offset += 8) {
++	  unsigned long _addr;
++    void *ptr, *auth, *sign;
++    u64 pptr_dst, pptr_src;
++
++    pptr_dst = (u64)dst + offset;
++    pptr_src = (u64)src + offset;
++    ptr = *(void**)pptr_src;
++
++	  _addr = (unsigned long)ptr;
++	  // remove PAC
++	  asm volatile(".arch armv8.3a\n" \
++	  			".arch_extension pauth\n" \
++	  			"xpacd %0"                \
++                   : "=&r" (_addr)  \
++                   :"0" (_addr)); 
++
++
++	  if (!is_valid_addr(__tag_reset(_addr)))
++	  	continue;
++
++	  asm volatile(".arch armv8.3a\n" \
++	  			       ".arch_extension pauth\n" \
++	  			       "pacda %0, %2"            \
++                 : "=&r" (auth)            \
++                   :"0" (_addr), "r" ((unsigned long)pptr_src));
++
++    if (auth != ptr) {
++		  if (debug_petal) {
++		  	pr_info("ppac_copy mismatch: %llx (%llx)\n", ptr, pptr_src);
++        		pc = __builtin_return_address(0);
++        		pr_info("func: %llx (%ps)\n", pc, pc);
++        		dump_backtrace(NULL, current, KERN_DEFAULT);
++		  } else {
++        panic("ppac_copy mismatch!");
++      }
++    }
++	  auth = (void*)_addr;
++
++    asm volatile(".arch armv8.3a\n" \
++				         ".arch_extension pauth\n" \
++				         "pacda %0, %2"            \
++                : "=&r" (sign)             \
++                :"0" (auth), "r" ((unsigned long)pptr_dst));
++
++    *(void**)pptr_dst = sign;
++  }
++	return;
++}
++EXPORT_SYMBOL(ppac_copy_all);
++
++void *ppac_load(void **ptr) {
++  return *ptr;
++}
++EXPORT_SYMBOL(ppac_load);
++
++void *ppac_skip(void *ptr) {
++  return ptr;
++}
++EXPORT_SYMBOL(ppac_skip);
++
++inline void *alloc_mte(void *addr, u64 size) {
++  void *ptr = addr;
++  u8 tag;
++
++  if (!addr)
++	return addr;
++
++  tag = mte_get_random_tag();
++  ptr = (void*)__tag_set((const void*)ptr, tag);
++
++  mte_set_mem_tag_range(addr, size, tag, false);
++
++  return ptr;
++}
++EXPORT_SYMBOL(alloc_mte);
++
++inline void *kmem_cache_mte(void *addr, void *slab) {
++  void *ptr = addr;
++  u64 size = *((u32*)slab+7);
++  u8 tag;
++  void (*ctor)(void *);
++
++  if (!addr)
++    return addr;
++
++  tag = mte_get_random_tag();
++  ptr = (void*)__tag_set((const void*)ptr, tag);
++  
++  mte_set_mem_tag_range(addr, size, tag, 0);
++
++  ctor = (void*)(*((u64*)slab+9));
++  if (ctor) {
++    ctor(ptr);
++  }
++
++  return ptr;
++}
++EXPORT_SYMBOL(kmem_cache_mte);
++
++inline void *alloc_normal(void *addr, u64 size) {
++  u8 tag;
++  void *ptr;
++  if (!addr)
++    return addr;
++  if (!size)
++    return addr;
++
++  tag = 0xf0;
++  mte_set_mem_tag_range(addr, size, tag, 0);
++  ptr = addr;
++
++  return ptr;
++}
++EXPORT_SYMBOL(alloc_normal);
++
++inline void *set_tag_n(const void *addr) {
++    void *tagged = (void *)addr;
++    tagged = (void *) (((unsigned long long) (tagged)) & 0xf0ffffffffffffff);
++    return tagged;
++}
++EXPORT_SYMBOL(set_tag_n);
++
++#endif // CONFIG_ARM64_PTR_AUTH
+ 
+ int ptrauth_prctl_reset_keys(struct task_struct *tsk, unsigned long arg)
+ {
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 23efabcb0..e1c510c58 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -214,7 +214,7 @@ void __show_regs(struct pt_regs *regs)
+ 
+ 	show_regs_print_info(KERN_DEFAULT);
+ 	print_pstate(regs);
+-
++	printk("pc : %llx\n", (unsigned long long)regs->pc);
+ 	if (!user_mode(regs)) {
+ 		printk("pc : %pS\n", (void *)regs->pc);
+ 		printk("lr : %pS\n", (void *)ptrauth_strip_insn_pac(lr));
+@@ -222,6 +222,7 @@ void __show_regs(struct pt_regs *regs)
+ 		printk("pc : %016llx\n", regs->pc);
+ 		printk("lr : %016llx\n", lr);
+ 	}
++  printk("tpidr_el1: %llx\n", read_sysreg(tpidr_el1));
+ 
+ 	printk("sp : %016llx\n", sp);
+ 
+@@ -473,7 +474,7 @@ void update_sctlr_el1(u64 sctlr)
+ 	 * EnIA must not be cleared while in the kernel as this is necessary for
+ 	 * in-kernel PAC. It will be cleared on kernel exit if needed.
+ 	 */
+-	sysreg_clear_set(sctlr_el1, SCTLR_USER_MASK & ~SCTLR_ELx_ENIA, sctlr);
++	sysreg_clear_set(sctlr_el1, SCTLR_USER_MASK & ~SCTLR_ELx_ENIA & ~SCTLR_ELx_ENDA, sctlr);
+ 
+ 	/* ISB required for the kernel uaccess routines when setting TCF0. */
+ 	isb();
+diff --git a/arch/arm64/kvm/hyp/nvhe/switch.c b/arch/arm64/kvm/hyp/nvhe/switch.c
+index 4db5409f4..d4bae2217 100644
+--- a/arch/arm64/kvm/hyp/nvhe/switch.c
++++ b/arch/arm64/kvm/hyp/nvhe/switch.c
+@@ -34,6 +34,17 @@ DEFINE_PER_CPU(struct kvm_host_data, kvm_host_data);
+ DEFINE_PER_CPU(struct kvm_cpu_context, kvm_hyp_ctxt);
+ DEFINE_PER_CPU(unsigned long, kvm_hyp_vector);
+ 
++//noinline void *__kvm_nvhe_builtin_container_of(void *mptr, size_t offset) {
++//        return mptr - offset;
++//}
++#define hyp_container_of(ptr, type, member) ({        \
++   void *__mptr = (void *)(ptr);         \
++   BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) && \
++        !__same_type(*(ptr), void),      \
++        "pointer type mismatch in container_of()");  \
++   ((type *)(__mptr - offsetof(type, member))); })
++
++
+ static void __activate_traps(struct kvm_vcpu *vcpu)
+ {
+ 	u64 val;
+@@ -128,7 +139,7 @@ static bool __pmu_switch_to_guest(struct kvm_cpu_context *host_ctxt)
+ 	struct kvm_host_data *host;
+ 	struct kvm_pmu_events *pmu;
+ 
+-	host = container_of(host_ctxt, struct kvm_host_data, host_ctxt);
++	host = hyp_container_of(host_ctxt, struct kvm_host_data, host_ctxt);
+ 	pmu = &host->pmu_events;
+ 
+ 	if (pmu->events_host)
+@@ -148,7 +159,7 @@ static void __pmu_switch_to_host(struct kvm_cpu_context *host_ctxt)
+ 	struct kvm_host_data *host;
+ 	struct kvm_pmu_events *pmu;
+ 
+-	host = container_of(host_ctxt, struct kvm_host_data, host_ctxt);
++	host = hyp_container_of(host_ctxt, struct kvm_host_data, host_ctxt);
+ 	pmu = &host->pmu_events;
+ 
+ 	if (pmu->events_guest)
+diff --git a/arch/arm64/kvm/hyp/nvhe/sysreg-sr.c b/arch/arm64/kvm/hyp/nvhe/sysreg-sr.c
+index 29305022b..6acff73d9 100644
+--- a/arch/arm64/kvm/hyp/nvhe/sysreg-sr.c
++++ b/arch/arm64/kvm/hyp/nvhe/sysreg-sr.c
+@@ -17,6 +17,9 @@
+ /*
+  * Non-VHE: Both host and guest must save everything.
+  */
++noinline void *builtin_container_of(void *mptr, size_t offset) {
++        return mptr - offset;
++}
+ 
+ void __sysreg_save_state_nvhe(struct kvm_cpu_context *ctxt)
+ {
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 632762039..cf8aa53be 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -41,6 +41,9 @@
+ #include <asm/system_misc.h>
+ #include <asm/tlbflush.h>
+ #include <asm/traps.h>
++#include <asm/stacktrace.h>
++
++
+ 
+ struct fault_info {
+ 	int	(*fn)(unsigned long far, unsigned long esr,
+@@ -333,8 +336,8 @@ static void do_tag_recovery(unsigned long addr, unsigned long esr,
+ 	 * It will be done lazily on the other CPUs when they will hit a
+ 	 * tag fault.
+ 	 */
+-	sysreg_clear_set(sctlr_el1, SCTLR_ELx_TCF_MASK, SCTLR_ELx_TCF_NONE);
+-	isb();
++	//sysreg_clear_set(sctlr_el1, SCTLR_ELx_TCF_MASK, SCTLR_ELx_TCF_NONE);
++	//isb();
+ }
+ 
+ static bool is_el1_mte_sync_tag_check_fault(unsigned long esr)
+@@ -355,11 +358,31 @@ static bool is_translation_fault(unsigned long esr)
+ 	return (esr & ESR_ELx_FSC_TYPE) == ESR_ELx_FSC_FAULT;
+ }
+ 
++static int handle_pac_fault(unsigned long addr, struct pt_regs *regs) {
++	int res = 0;
++	int i;
++	if ((((addr >> 39) & 0xffff) != 0xffff) && (((addr >> 60) & 0xf) == 0xf)) {
++		//pr_info("pac fault: %llx at %llx\n", addr, (u64)regs->pc);
++		for (i=0; i < 31; ++i) {
++			u64 r = regs->regs[i];
++			if ((r >> 16) == (addr >> 16)) {
++				r |= 0x007fff8000000000;
++				regs->regs[i] = r;
++				res |= 1;
++			}
++		}
++	}
++	return res;
++}
++
+ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
+ 			      struct pt_regs *regs)
+ {
+ 	const char *msg;
+ 
++  if (handle_pac_fault(addr, regs) > 0)
++    return;
++
+ 	/*
+ 	 * Are we prepared to handle this kernel fault?
+ 	 * We are almost certainly not prepared to handle instruction faults.
+@@ -374,7 +397,7 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
+ 	if (is_el1_mte_sync_tag_check_fault(esr)) {
+ 		do_tag_recovery(addr, esr, regs);
+ 
+-		return;
++		//return;
+ 	}
+ 
+ 	if (is_el1_permission_fault(addr, esr, regs)) {
+@@ -567,7 +590,11 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+ 	}
+ 
+ 	if (is_ttbr0_addr(addr) && is_el1_permission_fault(addr, esr, regs)) {
+-		if (is_el1_instruction_abort(esr))
++		
++    if (handle_pac_fault(addr, regs) > 0)
++			return 0;
++
++	if (is_el1_instruction_abort(esr))
+ 			die_kernel_fault("execution of user memory",
+ 					 addr, esr, regs);
+ 
+@@ -734,12 +761,23 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
+ static int do_tag_check_fault(unsigned long far, unsigned long esr,
+ 			      struct pt_regs *regs)
+ {
++  unsigned long pc;
++	char buf[0x50];
++
++	pc = instruction_pointer(regs);
++
++	snprintf(buf, sizeof(buf), "%ps", (void*)pc);
++	pr_info("func: %ps\n", (void*)pc);
++	printk("addr: %llx, mtag: %x\n", far, 0xf&mte_get_mem_tag((void*)(far)));
++	
++  dump_backtrace(NULL, current, KERN_DEFAULT);
+ 	/*
+ 	 * The architecture specifies that bits 63:60 of FAR_EL1 are UNKNOWN
+ 	 * for tag check faults. Set them to corresponding bits in the untagged
+ 	 * address.
+ 	 */
+-	far = (__untagged_addr(far) & ~MTE_TAG_MASK) | (far & MTE_TAG_MASK);
++
++ 	far = (__untagged_addr(far) & ~MTE_TAG_MASK) | (far & MTE_TAG_MASK);
+ 	do_bad_area(far, esr, regs);
+ 	return 0;
+ }
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index 668068924..55e5b5f16 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -556,6 +556,7 @@ static void __init map_mem(pgd_t *pgdp)
+ 		 * if MTE is present. Otherwise, it has the same attributes as
+ 		 * PAGE_KERNEL.
+ 		 */
++    pr_err("memblock start: %llx (%llx), end: %llx (%llx)\n", __phys_to_virt(start), start, __phys_to_virt(end), end);
+ 		__map_memblock(pgdp, start, end, pgprot_tagged(PAGE_KERNEL),
+ 			       flags);
+ 	}
+@@ -570,7 +571,11 @@ static void __init map_mem(pgd_t *pgdp)
+ 	 * Note that contiguous mappings cannot be remapped in this way,
+ 	 * so we should avoid them here.
+ 	 */
+-	__map_memblock(pgdp, kernel_start, kernel_end,
++	
++  pr_err("memblock kernel_start: %llx (%llx), kernel_end: %llx (%llx)\n",
++		   __phys_to_virt(kernel_start), kernel_start, __phys_to_virt(kernel_end), kernel_end);
++	pr_err("PHYS_OFFSET: %llx, PAGE_OFSET: %llx\n", PHYS_OFFSET, PAGE_OFFSET);
++  __map_memblock(pgdp, kernel_start, kernel_end,
+ 		       PAGE_KERNEL, NO_CONT_MAPPINGS);
+ 	memblock_clear_nomap(kernel_start, kernel_end - kernel_start);
+ 
+diff --git a/drivers/clk/clk.c b/drivers/clk/clk.c
+index b37af6b27..32be7e424 100644
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -2945,7 +2945,7 @@ EXPORT_SYMBOL_GPL(clk_is_match);
+ #ifdef CONFIG_DEBUG_FS
+ #include <linux/debugfs.h>
+ 
+-static struct dentry *rootdir;
++static struct dentry *rootdir_kdfi1;
+ static int inited = 0;
+ static DEFINE_MUTEX(clk_debug_lock);
+ static HLIST_HEAD(clk_debug_list);
+@@ -3332,7 +3332,7 @@ static void clk_debug_register(struct clk_core *core)
+ 	mutex_lock(&clk_debug_lock);
+ 	hlist_add_head(&core->debug_node, &clk_debug_list);
+ 	if (inited)
+-		clk_debug_create_one(core, rootdir);
++		clk_debug_create_one(core, rootdir_kdfi1);
+ 	mutex_unlock(&clk_debug_lock);
+ }
+ 
+@@ -3384,20 +3384,20 @@ static int __init clk_debug_init(void)
+ 	pr_warn("********************************************************************\n");
+ #endif
+ 
+-	rootdir = debugfs_create_dir("clk", NULL);
++	rootdir_kdfi1 = debugfs_create_dir("clk", NULL);
+ 
+-	debugfs_create_file("clk_summary", 0444, rootdir, &all_lists,
++	debugfs_create_file("clk_summary", 0444, rootdir_kdfi1, &all_lists,
+ 			    &clk_summary_fops);
+-	debugfs_create_file("clk_dump", 0444, rootdir, &all_lists,
++	debugfs_create_file("clk_dump", 0444, rootdir_kdfi1, &all_lists,
+ 			    &clk_dump_fops);
+-	debugfs_create_file("clk_orphan_summary", 0444, rootdir, &orphan_list,
++	debugfs_create_file("clk_orphan_summary", 0444, rootdir_kdfi1, &orphan_list,
+ 			    &clk_summary_fops);
+-	debugfs_create_file("clk_orphan_dump", 0444, rootdir, &orphan_list,
++	debugfs_create_file("clk_orphan_dump", 0444, rootdir_kdfi1, &orphan_list,
+ 			    &clk_dump_fops);
+ 
+ 	mutex_lock(&clk_debug_lock);
+ 	hlist_for_each_entry(core, &clk_debug_list, debug_node)
+-		clk_debug_create_one(core, rootdir);
++		clk_debug_create_one(core, rootdir_kdfi1);
+ 
+ 	inited = 1;
+ 	mutex_unlock(&clk_debug_lock);
+diff --git a/drivers/firmware/efi/libstub/Makefile b/drivers/firmware/efi/libstub/Makefile
+index 2c67f71f2..677b3c548 100644
+--- a/drivers/firmware/efi/libstub/Makefile
++++ b/drivers/firmware/efi/libstub/Makefile
+@@ -48,6 +48,7 @@ KBUILD_CFLAGS := $(filter-out $(RANDSTRUCT_CFLAGS), $(KBUILD_CFLAGS))
+ KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_SCS), $(KBUILD_CFLAGS))
+ # disable LTO
+ KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_LTO), $(KBUILD_CFLAGS))
++KBUILD_CFLAGS := $(filter-out -fsanitize=kdfi_instrument, $(KBUILD_CFLAGS))
+ 
+ GCOV_PROFILE			:= n
+ # Sanitizer runtimes are unavailable and cannot be linked here.
+diff --git a/drivers/firmware/efi/libstub/efistub.h b/drivers/firmware/efi/libstub/efistub.h
+index fbffdd729..be0dffc62 100644
+--- a/drivers/firmware/efi/libstub/efistub.h
++++ b/drivers/firmware/efi/libstub/efistub.h
+@@ -47,6 +47,9 @@ efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
+ #define efi_rt_call(func, ...)	efi_system_table->runtime->func(__VA_ARGS__)
+ #define efi_table_attr(inst, attr)	(inst->attr)
+ #define efi_call_proto(inst, func, ...) inst->func(inst, ##__VA_ARGS__)
++void *ppac_strip(void *addr);
++u64 mte_set_tcma(void);
++u64 mte_unset_tcma(void);
+ 
+ #endif
+ 
+@@ -861,3 +864,4 @@ efi_enable_reset_attack_mitigation(void) { }
+ void efi_retrieve_tpm2_eventlog(void);
+ 
+ #endif
++
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 500e0c6d1..d51d58a13 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -60,7 +60,7 @@ struct gic_chip_data {
+ };
+ 
+ static struct gic_chip_data gic_data __read_mostly;
+-static DEFINE_STATIC_KEY_TRUE(supports_deactivate_key);
++static DEFINE_STATIC_KEY_TRUE(supports_deactivate_key_kdfi0);
+ 
+ #define GIC_ID_NR	(1U << GICD_TYPER_ID_BITS(gic_data.rdists.gicd_typer))
+ #define GIC_LINE_NR	min(GICD_TYPER_SPIS(gic_data.rdists.gicd_typer), 1020U)
+@@ -638,7 +638,7 @@ static u64 gic_mpidr_to_affinity(unsigned long mpidr)
+ 
+ static void gic_deactivate_unhandled(u32 irqnr)
+ {
+-	if (static_branch_likely(&supports_deactivate_key)) {
++	if (static_branch_likely(&supports_deactivate_key_kdfi0)) {
+ 		if (irqnr < 8192)
+ 			gic_write_dir(irqnr);
+ 	} else {
+@@ -668,7 +668,7 @@ static void gic_deactivate_unhandled(u32 irqnr)
+  */
+ static inline void gic_complete_ack(u32 irqnr)
+ {
+-	if (static_branch_likely(&supports_deactivate_key))
++	if (static_branch_likely(&supports_deactivate_key_kdfi0))
+ 		write_gicreg(irqnr, ICC_EOIR1_EL1);
+ 
+ 	isb();
+@@ -1052,7 +1052,7 @@ static void gic_cpu_sys_reg_init(void)
+ 	 */
+ 	gic_write_bpr1(0);
+ 
+-	if (static_branch_likely(&supports_deactivate_key)) {
++	if (static_branch_likely(&supports_deactivate_key_kdfi0)) {
+ 		/* EOI drops priority only (mode 1) */
+ 		gic_write_ctlr(ICC_CTLR_EL1_EOImode_drop);
+ 	} else {
+@@ -1400,7 +1400,7 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int irq,
+ 	struct irq_chip *chip = &gic_chip;
+ 	struct irq_data *irqd = irq_desc_get_irq_data(irq_to_desc(irq));
+ 
+-	if (static_branch_likely(&supports_deactivate_key))
++	if (static_branch_likely(&supports_deactivate_key_kdfi0))
+ 		chip = &gic_eoimode1_chip;
+ 
+ 	switch (__get_intid_range(hw)) {
+@@ -1787,7 +1787,7 @@ static void gic_enable_nmi_support(void)
+ 
+ 	static_branch_enable(&supports_pseudo_nmis);
+ 
+-	if (static_branch_likely(&supports_deactivate_key))
++	if (static_branch_likely(&supports_deactivate_key_kdfi0))
+ 		gic_eoimode1_chip.flags |= IRQCHIP_SUPPORTS_NMI;
+ 	else
+ 		gic_chip.flags |= IRQCHIP_SUPPORTS_NMI;
+@@ -1803,9 +1803,9 @@ static int __init gic_init_bases(void __iomem *dist_base,
+ 	int err;
+ 
+ 	if (!is_hyp_mode_available())
+-		static_branch_disable(&supports_deactivate_key);
++		static_branch_disable(&supports_deactivate_key_kdfi0);
+ 
+-	if (static_branch_likely(&supports_deactivate_key))
++	if (static_branch_likely(&supports_deactivate_key_kdfi0))
+ 		pr_info("GIC: Using split EOI/Deactivate mode\n");
+ 
+ 	gic_data.fwnode = handle;
+@@ -2076,7 +2076,7 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
+ 
+ 	gic_populate_ppi_partitions(node);
+ 
+-	if (static_branch_likely(&supports_deactivate_key))
++	if (static_branch_likely(&supports_deactivate_key_kdfi0))
+ 		gic_of_setup_kvm_info(node);
+ 	return 0;
+ 
+@@ -2384,7 +2384,7 @@ gic_acpi_init(union acpi_subtable_headers *header, const unsigned long end)
+ 
+ 	acpi_set_irq_model(ACPI_IRQ_MODEL_GIC, domain_handle);
+ 
+-	if (static_branch_likely(&supports_deactivate_key))
++	if (static_branch_likely(&supports_deactivate_key_kdfi0))
+ 		gic_acpi_setup_kvm_info();
+ 
+ 	return 0;
+diff --git a/drivers/opp/debugfs.c b/drivers/opp/debugfs.c
+index 9eb71f474..76bf59aba 100644
+--- a/drivers/opp/debugfs.c
++++ b/drivers/opp/debugfs.c
+@@ -17,7 +17,7 @@
+ 
+ #include "opp.h"
+ 
+-static struct dentry *rootdir;
++static struct dentry *rootdir_kdfi0;
+ 
+ static void opp_set_dev_name(const struct device *dev, char *name)
+ {
+@@ -154,7 +154,7 @@ static void opp_list_debug_create_dir(struct opp_device *opp_dev,
+ 	opp_set_dev_name(dev, opp_table->dentry_name);
+ 
+ 	/* Create device specific directory */
+-	d = debugfs_create_dir(opp_table->dentry_name, rootdir);
++	d = debugfs_create_dir(opp_table->dentry_name, rootdir_kdfi0);
+ 
+ 	opp_dev->dentry = d;
+ 	opp_table->dentry = d;
+@@ -168,7 +168,7 @@ static void opp_list_debug_create_link(struct opp_device *opp_dev,
+ 	opp_set_dev_name(opp_dev->dev, name);
+ 
+ 	/* Create device specific directory link */
+-	opp_dev->dentry = debugfs_create_symlink(name, rootdir,
++	opp_dev->dentry = debugfs_create_symlink(name, rootdir_kdfi0,
+ 						 opp_table->dentry_name);
+ }
+ 
+@@ -207,7 +207,7 @@ static void opp_migrate_dentry(struct opp_device *opp_dev,
+ 
+ 	opp_set_dev_name(dev, opp_table->dentry_name);
+ 
+-	dentry = debugfs_rename(rootdir, opp_dev->dentry, rootdir,
++	dentry = debugfs_rename(rootdir_kdfi0, opp_dev->dentry, rootdir_kdfi0,
+ 				opp_table->dentry_name);
+ 	if (IS_ERR(dentry)) {
+ 		dev_err(dev, "%s: Failed to rename link from: %s to %s\n",
+@@ -247,7 +247,7 @@ void opp_debug_unregister(struct opp_device *opp_dev,
+ static int __init opp_debug_init(void)
+ {
+ 	/* Create /sys/kernel/debug/opp directory */
+-	rootdir = debugfs_create_dir("opp", NULL);
++	rootdir_kdfi0 = debugfs_create_dir("opp", NULL);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/pinctrl/core.c b/drivers/pinctrl/core.c
+index 456b72041..7a256c1da 100644
+--- a/drivers/pinctrl/core.c
++++ b/drivers/pinctrl/core.c
+@@ -1886,7 +1886,7 @@ static int pinctrl_show(struct seq_file *s, void *what)
+ }
+ DEFINE_SHOW_ATTRIBUTE(pinctrl);
+ 
+-static struct dentry *debugfs_root;
++static struct dentry *debugfs_root_kdfi1;
+ 
+ static void pinctrl_init_device_debugfs(struct pinctrl_dev *pctldev)
+ {
+@@ -1907,7 +1907,7 @@ static void pinctrl_init_device_debugfs(struct pinctrl_dev *pctldev)
+ 		debugfs_name = dev_name(pctldev->dev);
+ 	}
+ 
+-	device_root = debugfs_create_dir(debugfs_name, debugfs_root);
++	device_root = debugfs_create_dir(debugfs_name, debugfs_root_kdfi1);
+ 	pctldev->device_root = device_root;
+ 
+ 	if (IS_ERR(device_root) || !device_root) {
+@@ -1934,19 +1934,19 @@ static void pinctrl_remove_device_debugfs(struct pinctrl_dev *pctldev)
+ 
+ static void pinctrl_init_debugfs(void)
+ {
+-	debugfs_root = debugfs_create_dir("pinctrl", NULL);
+-	if (IS_ERR(debugfs_root) || !debugfs_root) {
++	debugfs_root_kdfi1 = debugfs_create_dir("pinctrl", NULL);
++	if (IS_ERR(debugfs_root_kdfi1) || !debugfs_root_kdfi1) {
+ 		pr_warn("failed to create debugfs directory\n");
+-		debugfs_root = NULL;
++		debugfs_root_kdfi1 = NULL;
+ 		return;
+ 	}
+ 
+ 	debugfs_create_file("pinctrl-devices", 0444,
+-			    debugfs_root, NULL, &pinctrl_devices_fops);
++			    debugfs_root_kdfi1, NULL, &pinctrl_devices_fops);
+ 	debugfs_create_file("pinctrl-maps", 0444,
+-			    debugfs_root, NULL, &pinctrl_maps_fops);
++			    debugfs_root_kdfi1, NULL, &pinctrl_maps_fops);
+ 	debugfs_create_file("pinctrl-handles", 0444,
+-			    debugfs_root, NULL, &pinctrl_fops);
++			    debugfs_root_kdfi1, NULL, &pinctrl_fops);
+ }
+ 
+ #else /* CONFIG_DEBUG_FS */
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 8ad50dc8f..86f8b1114 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -42,7 +42,7 @@ static LIST_HEAD(regulator_supply_alias_list);
+ static LIST_HEAD(regulator_coupler_list);
+ static bool has_full_constraints;
+ 
+-static struct dentry *debugfs_root;
++static struct dentry *debugfs_root_kdfi0;
+ 
+ /*
+  * struct regulator_map
+@@ -5190,7 +5190,7 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
+ 		rname = name;
+ 	}
+ 
+-	rdev->debugfs = debugfs_create_dir(rname, debugfs_root);
++	rdev->debugfs = debugfs_create_dir(rname, debugfs_root_kdfi0);
+ 	if (IS_ERR(rdev->debugfs))
+ 		rdev_dbg(rdev, "Failed to create debugfs directory\n");
+ 
+@@ -6094,15 +6094,15 @@ static int __init regulator_init(void)
+ 
+ 	ret = class_register(&regulator_class);
+ 
+-	debugfs_root = debugfs_create_dir("regulator", NULL);
+-	if (IS_ERR(debugfs_root))
++	debugfs_root_kdfi0 = debugfs_create_dir("regulator", NULL);
++	if (IS_ERR(debugfs_root_kdfi0))
+ 		pr_debug("regulator: Failed to create debugfs directory\n");
+ 
+ #ifdef CONFIG_DEBUG_FS
+-	debugfs_create_file("supply_map", 0444, debugfs_root, NULL,
++	debugfs_create_file("supply_map", 0444, debugfs_root_kdfi0, NULL,
+ 			    &supply_map_fops);
+ 
+-	debugfs_create_file("regulator_summary", 0444, debugfs_root,
++	debugfs_create_file("regulator_summary", 0444, debugfs_root_kdfi0,
+ 			    NULL, &regulator_summary_fops);
+ #endif
+ 	regulator_dummy_init();
+diff --git a/fs/fs_context.c b/fs/fs_context.c
+index 851214d1d..814585203 100644
+--- a/fs/fs_context.c
++++ b/fs/fs_context.c
+@@ -96,8 +96,8 @@ int vfs_parse_fs_param_source(struct fs_context *fc, struct fs_parameter *param)
+ 	if (strcmp(param->key, "source") != 0)
+ 		return -ENOPARAM;
+ 
+-	if (param->type != fs_value_is_string)
+-		return invalf(fc, "Non-string source");
++	//if (param->type != fs_value_is_string)
++	//	return invalf(fc, "Non-string source");
+ 
+ 	if (fc->source)
+ 		return invalf(fc, "Multiple sources");
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index 4192fe6ec..d658e815d 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -1570,7 +1570,7 @@ struct ctl_table_header *__register_sysctl_paths(
+ 		if (!header)
+ 			goto out;
+ 
+-		subheaders = (struct ctl_table_header **) (header + 1);
++		subheaders = ppac_skip((struct ctl_table_header **) (header + 1));
+ 		subheader = subheaders;
+ 		header->ctl_table_arg = ctl_table_arg;
+ 
+diff --git a/fs/quota/dquot.c b/fs/quota/dquot.c
+index 75e593b1c..d08460b72 100644
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -3026,7 +3026,7 @@ static struct ctl_table fs_dqstats_table[] = {
+ 	{ },
+ };
+ 
+-static struct ctl_table fs_table[] = {
++static struct ctl_table fs_table_kdfi0[] = {
+ 	{
+ 		.procname	= "quota",
+ 		.mode		= 0555,
+@@ -3039,7 +3039,7 @@ static struct ctl_table sys_table[] = {
+ 	{
+ 		.procname	= "fs",
+ 		.mode		= 0555,
+-		.child		= fs_table,
++		.child		= fs_table_kdfi0,
+ 	},
+ 	{ },
+ };
+diff --git a/fs/read_write.c b/fs/read_write.c
+index b4b15279b..fc9c49e69 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -963,6 +963,10 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
+ 	ssize_t ret = -EBADF;
+ 
+ 	if (f.file) {
++    if (strstr(current->comm, "cve-2021-4154")) {
++      pr_info("do_writev: %llx\n", (unsigned long)f.file);
++    }
++
+ 		loff_t pos, *ppos = file_ppos(f.file);
+ 		if (ppos) {
+ 			pos = *ppos;
+diff --git a/include/linux/kasan-tags.h b/include/linux/kasan-tags.h
+index 4f85f5625..788c06032 100644
+--- a/include/linux/kasan-tags.h
++++ b/include/linux/kasan-tags.h
+@@ -2,14 +2,14 @@
+ #ifndef _LINUX_KASAN_TAGS_H
+ #define _LINUX_KASAN_TAGS_H
+ 
+-#define KASAN_TAG_KERNEL	0xFF /* native kernel pointers tag */
+-#define KASAN_TAG_INVALID	0xFE /* inaccessible memory tag */
+-#define KASAN_TAG_MAX		0xFD /* maximum value for random tags */
++#define KASAN_TAG_KERNEL	0xF0 /* native kernel pointers tag */
++#define KASAN_TAG_INVALID	0xF0 /* inaccessible memory tag */
++#define KASAN_TAG_MAX		0xFE /* maximum value for random tags */
+ 
+ #ifdef CONFIG_KASAN_HW_TAGS
+ #define KASAN_TAG_MIN		0xF0 /* minimum value for random tags */
+ #else
+-#define KASAN_TAG_MIN		0x00 /* minimum value for random tags */
++#define KASAN_TAG_MIN		0xF0 /* minimum value for random tags */
+ #endif
+ 
+ #endif /* LINUX_KASAN_TAGS_H */
+diff --git a/include/linux/kasan.h b/include/linux/kasan.h
+index 00cbe31c8..19b127a17 100644
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@ -16,6 +16,7 @@ struct task_struct;
+ 
+ #include <linux/linkage.h>
+ #include <asm/kasan.h>
++#include <asm/pointer_auth.h>
+ 
+ /* kasan_data struct is used in KUnit tests for KASAN expected failures */
+ struct kunit_kasan_expectation {
+@@ -191,6 +192,7 @@ static __always_inline size_t kasan_metadata_size(struct kmem_cache *cache)
+ void __kasan_poison_slab(struct page *page);
+ static __always_inline void kasan_poison_slab(struct page *page)
+ {
++  // JH
+ 	if (kasan_enabled())
+ 		__kasan_poison_slab(page);
+ }
+@@ -226,6 +228,9 @@ bool __kasan_slab_free(struct kmem_cache *s, void *object,
+ static __always_inline bool kasan_slab_free(struct kmem_cache *s,
+ 						void *object, bool init)
+ {
++  // JH
++  //u64 size = *((u32*)s+7);
++  //mte_set_mem_tag_range(object, size, 0xf0, false);
+ 	if (kasan_enabled())
+ 		return __kasan_slab_free(s, object, _RET_IP_, init);
+ 	return false;
+@@ -400,7 +405,7 @@ bool kasan_report(unsigned long addr, size_t size,
+ 
+ static inline void *kasan_reset_tag(const void *addr)
+ {
+-	return (void *)addr;
++	return (void *)__tag_reset(addr);
+ }
+ 
+ #endif /* CONFIG_KASAN_SW_TAGS || CONFIG_KASAN_HW_TAGS*/
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index f56cd8879..51e7e0b66 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -388,6 +388,7 @@ int __trace_bprintk(unsigned long ip, const char *fmt, ...);
+ extern __printf(2, 3)
+ int __trace_printk(unsigned long ip, const char *fmt, ...);
+ 
++
+ /**
+  * trace_puts - write a string into the ftrace buffer
+  * @str: the string to record
+@@ -483,6 +484,7 @@ static inline void ftrace_dump(enum ftrace_dump_mode oops_dump_mode) { }
+ #define __CONCAT(a, b) a ## b
+ #define CONCATENATE(a, b) __CONCAT(a, b)
+ 
++extern noinline void *builtin_container_of(void *mptr, size_t offset);
+ /**
+  * container_of - cast a member of a structure out to the containing structure
+  * @ptr:	the pointer to the member.
+@@ -495,7 +497,9 @@ static inline void ftrace_dump(enum ftrace_dump_mode oops_dump_mode) { }
+ 	BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) &&	\
+ 			 !__same_type(*(ptr), void),			\
+ 			 "pointer type mismatch in container_of()");	\
+-	((type *)(__mptr - offsetof(type, member))); })
++  ((type *)(builtin_container_of(__mptr, offsetof(type, member)))); })
++    //((type *)(__mptr - offsetof(type, member))); })
++
+ 
+ /**
+  * container_of_safe - cast a member of a structure out to the containing structure
+@@ -510,8 +514,9 @@ static inline void ftrace_dump(enum ftrace_dump_mode oops_dump_mode) { }
+ 	BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) &&	\
+ 			 !__same_type(*(ptr), void),			\
+ 			 "pointer type mismatch in container_of()");	\
+-	IS_ERR_OR_NULL(__mptr) ? ERR_CAST(__mptr) :			\
+-		((type *)(__mptr - offsetof(type, member))); })
++  ((type *)(builtin_container_of(__mptr, offsetof(type, member)))); })
++    //IS_ERR_OR_NULL(__mptr) ? ERR_CAST(__mptr) :       \
++  //  ((type *)(__mptr - offsetof(type, member))); })
+ 
+ /* Rebuild everything on CONFIG_FTRACE_MCOUNT_RECORD */
+ #ifdef CONFIG_FTRACE_MCOUNT_RECORD
+diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+index 5535be101..7b78120a3 100644
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@ -88,6 +88,7 @@ struct vmap_area {
+ 		struct vm_struct *vm;           /* in "busy" tree */
+ 	};
+ };
++extern struct rb_root vmap_area_root;
+ 
+ /* archs that select HAVE_ARCH_HUGE_VMAP should override one or more of these */
+ #ifndef arch_vmap_p4d_supported
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1c5fb86d4..eb5243201 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -879,9 +879,12 @@ __SYSCALL(__NR_memfd_secret, sys_memfd_secret)
+ #endif
+ #define __NR_process_mrelease 448
+ __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
++#define __NR_petal_test 449
++__SYSCALL(__NR_petal_test, sys_petal_test)
++
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 449
++#define __NR_syscalls 450
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/init/init_task.c b/init/init_task.c
+index 2d024066e..84c849f3a 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -15,7 +15,7 @@
+ 
+ #include <linux/uaccess.h>
+ 
+-static struct signal_struct init_signals = {
++struct signal_struct init_signals = {
+ 	.nr_threads	= 1,
+ 	.thread_head	= LIST_HEAD_INIT(init_task.thread_node),
+ 	.wait_chldexit	= __WAIT_QUEUE_HEAD_INITIALIZER(init_signals.wait_chldexit),
+@@ -42,6 +42,7 @@ static struct signal_struct init_signals = {
+ 	},
+ 	INIT_PREV_CPUTIME(init_signals)
+ };
++EXPORT_SYMBOL(init_signals);
+ 
+ static struct sighand_struct init_sighand = {
+ 	.count		= REFCOUNT_INIT(1),
+diff --git a/init/main.c b/init/main.c
+index 5c81d7fb2..b22faae61 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -101,6 +101,8 @@
+ #include <linux/stackdepot.h>
+ #include <linux/randomize_kstack.h>
+ #include <net/net_namespace.h>
++#include <asm/pointer_auth.h>
++#include <asm/mte.h>
+ 
+ #include <asm/io.h>
+ #include <asm/setup.h>
+@@ -938,6 +940,15 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	char *command_line;
+ 	char *after_dashes;
+ 
++  //get_random_bytes(&init_task.thread.keys_kernel.apda,
++	//				 sizeof(init_task.thread.keys_kernel.apda));
++
++	__ptrauth_key_install_nosync(APDA, init_task.thread.keys_kernel.apda);
++
++	ptrauth_enable();
++
++  kdfi_sign_globals();
++  mte_set_tcma();
+ 	set_task_stack_end_magic(&init_task);
+ 	smp_setup_processor_id();
+ 	debug_objects_early_init();
+@@ -961,8 +972,17 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+ 	setup_command_line(command_line);
+ 	setup_nr_cpu_ids();
+ 	setup_per_cpu_areas();
+-	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+-	boot_cpu_hotplug_init();
++	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */	
++
++	// PeTAL: set SCTLR register
++	mte_enable_kernel_sync();
++	sysreg_clear_set(sctlr_el1, SCTLR_ELx_TCF_MASK, SCTLR_ELx_TCF_SYNC);
++	isb();
++
++	// PeTAL: tag sensitive global variables
++	//kdfi_tag_globals();
++
++  boot_cpu_hotplug_init();
+ 
+ 	build_all_zonelists(NULL);
+ 	page_alloc_init();
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 599cb9264..a663c9055 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o smpboot.o ucount.o regset.o
++	    async.o range.o smpboot.o ucount.o regset.o kdfi.o
+ 
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MODULES) += kmod.o
+diff --git a/kernel/kcmp.c b/kernel/kcmp.c
+index 5353edfad..c03896695 100644
+--- a/kernel/kcmp.c
++++ b/kernel/kcmp.c
+@@ -18,6 +18,7 @@
+ #include <linux/file.h>
+ 
+ #include <asm/unistd.h>
++#include <asm/memory.h>
+ 
+ /*
+  * We don't expose the real in-memory order of objects for security reasons.
+@@ -51,6 +52,10 @@ static int kcmp_ptr(void *v1, void *v2, enum kcmp_type type)
+ {
+ 	long t1, t2;
+ 
++  pr_info("v1: %llx, v2: %llx\n", (long)v1, (long)v2);
++  v1 = __tag_reset(v1);
++  v2 = __tag_reset(v2);
++  
+ 	t1 = kptr_obfuscate((long)v1, type);
+ 	t2 = kptr_obfuscate((long)v2, type);
+ 
+diff --git a/kernel/kdfi.c b/kernel/kdfi.c
+new file mode 100644
+index 000000000..47e11a30b
+--- /dev/null
++++ b/kernel/kdfi.c
+@@ -0,0 +1,34 @@
++#include <linux/unistd.h>
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <asm/sysreg.h>
++
++void petal_print(void) {
++    pr_err("PETAL TEST\n");
++}
++EXPORT_SYMBOL(petal_print);
++
++SYSCALL_DEFINE2(petal_test, unsigned int, mode, uint64_t, addr)
++{
++  unsigned int *ptr = (unsigned int*) addr;
++  unsigned int res = 0;
++
++  if (mode == 0) {
++    // Disable MTE by setting TCO 1
++    SET_PSTATE_TCO(1); 
++  } else if (mode == 1) {
++    // ENable MTE by setting TCO 0
++    SET_PSTATE_TCO(0);
++  } else if (mode == 2) {
++    res = *ptr;
++    pr_err("%llx: %x\n", addr, res); 
++  }
++  return res;
++}
++
++void __init kdfi_sign_globals(void) {
++	return;
++}
++void __init kdfi_tag_globals(void) {
++  return;
++}
+diff --git a/kernel/power/snapshot.c b/kernel/power/snapshot.c
+index 2b063e0a1..bb9fd65cb 100644
+--- a/kernel/power/snapshot.c
++++ b/kernel/power/snapshot.c
+@@ -1474,7 +1474,7 @@ static unsigned int nr_meta_pages;
+  * Numbers of normal and highmem page frames allocated for hibernation image
+  * before suspending devices.
+  */
+-static unsigned int alloc_normal, alloc_highmem;
++static unsigned int alloc_normal_kdfi, alloc_highmem;
+ /*
+  * Memory bitmap used for marking saveable pages (during hibernation) or
+  * hibernation image pages (during restore)
+@@ -1536,7 +1536,7 @@ void swsusp_free(void)
+ 	nr_meta_pages = 0;
+ 	restore_pblist = NULL;
+ 	buffer = NULL;
+-	alloc_normal = 0;
++	alloc_normal_kdfi = 0;
+ 	alloc_highmem = 0;
+ 	hibernate_restore_protection_end();
+ }
+@@ -1566,7 +1566,7 @@ static unsigned long preallocate_image_pages(unsigned long nr_pages, gfp_t mask)
+ 		if (PageHighMem(page))
+ 			alloc_highmem++;
+ 		else
+-			alloc_normal++;
++			alloc_normal_kdfi++;
+ 		nr_pages--;
+ 		nr_alloc++;
+ 	}
+@@ -1579,10 +1579,10 @@ static unsigned long preallocate_image_memory(unsigned long nr_pages,
+ {
+ 	unsigned long alloc;
+ 
+-	if (avail_normal <= alloc_normal)
++	if (avail_normal <= alloc_normal_kdfi)
+ 		return 0;
+ 
+-	alloc = avail_normal - alloc_normal;
++	alloc = avail_normal - alloc_normal_kdfi;
+ 	if (nr_pages < alloc)
+ 		alloc = nr_pages;
+ 
+@@ -1633,12 +1633,12 @@ static unsigned long free_unnecessary_pages(void)
+ 	unsigned long save, to_free_normal, to_free_highmem, free;
+ 
+ 	save = count_data_pages();
+-	if (alloc_normal >= save) {
+-		to_free_normal = alloc_normal - save;
++	if (alloc_normal_kdfi >= save) {
++		to_free_normal = alloc_normal_kdfi - save;
+ 		save = 0;
+ 	} else {
+ 		to_free_normal = 0;
+-		save -= alloc_normal;
++		save -= alloc_normal_kdfi;
+ 	}
+ 	save += count_highmem_pages();
+ 	if (alloc_highmem >= save) {
+@@ -1668,7 +1668,7 @@ static unsigned long free_unnecessary_pages(void)
+ 			if (!to_free_normal)
+ 				continue;
+ 			to_free_normal--;
+-			alloc_normal--;
++			alloc_normal_kdfi--;
+ 		}
+ 		memory_bm_clear_bit(&copy_bm, pfn);
+ 		swsusp_unset_page_forbidden(page);
+@@ -1752,7 +1752,7 @@ int hibernate_preallocate_memory(void)
+ 		goto err_out;
+ 	}
+ 
+-	alloc_normal = 0;
++	alloc_normal_kdfi = 0;
+ 	alloc_highmem = 0;
+ 
+ 	/* Count the number of saveable data pages. */
+@@ -1910,7 +1910,7 @@ static unsigned int count_pages_for_highmem(unsigned int nr_highmem) { return 0;
+ static int enough_free_mem(unsigned int nr_pages, unsigned int nr_highmem)
+ {
+ 	struct zone *zone;
+-	unsigned int free = alloc_normal;
++	unsigned int free = alloc_normal_kdfi;
+ 
+ 	for_each_populated_zone(zone)
+ 		if (!is_highmem(zone))
+@@ -1988,8 +1988,8 @@ static int swsusp_alloc(struct memory_bitmap *copy_bm,
+ 			nr_pages += alloc_highmem_pages(copy_bm, nr_highmem);
+ 		}
+ 	}
+-	if (nr_pages > alloc_normal) {
+-		nr_pages -= alloc_normal;
++	if (nr_pages > alloc_normal_kdfi) {
++		nr_pages -= alloc_normal_kdfi;
+ 		while (nr_pages-- > 0) {
+ 			struct page *page;
+ 
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 2efab4474..c7806597a 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -132,6 +132,11 @@
+ # define GET_TAGGED_ADDR_CTRL()		(-EINVAL)
+ #endif
+ 
++noinline void *builtin_container_of(void *mptr, size_t offset) {
++       return mptr - offset;
++}
++EXPORT_SYMBOL(builtin_container_of);
++
+ /*
+  * this is where the system-wide overflow UID and GID are defined, for
+  * architectures that now have 32-bit UID/GID but didn't in the past
+diff --git a/lib/Kconfig b/lib/Kconfig
+index baa977e00..8736d7cf0 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -3,6 +3,11 @@
+ # Library configuration
+ #
+ 
++config PETAL
++  bool "PETAL"
++  help
++    petal
++
+ config BINARY_PRINTF
+ 	def_bool n
+ 
+diff --git a/mm/kasan/common.c b/mm/kasan/common.c
+index 2baf121fb..15c60857f 100644
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@ -253,8 +253,11 @@ void __kasan_poison_slab(struct page *page)
+ 
+ 	for (i = 0; i < compound_nr(page); i++)
+ 		page_kasan_tag_reset(page + i);
+-	kasan_poison(page_address(page), page_size(page),
+-		     KASAN_KMALLOC_REDZONE, false);
++  kasan_poison(page_address(page), page_size(page),
++		     0xf0, false);
++
++	//kasan_poison(page_address(page), page_size(page),
++	//	     KASAN_KMALLOC_REDZONE, false);
+ }
+ 
+ void __kasan_unpoison_object_data(struct kmem_cache *cache, void *object)
+diff --git a/mm/kasan/hw_tags.c b/mm/kasan/hw_tags.c
+index 05d1e9460..ab92b0d0c 100644
+--- a/mm/kasan/hw_tags.c
++++ b/mm/kasan/hw_tags.c
+@@ -57,13 +57,15 @@ static int __init early_kasan_flag(char *arg)
+ {
+ 	if (!arg)
+ 		return -EINVAL;
+-
++/*
+ 	if (!strcmp(arg, "off"))
+ 		kasan_arg = KASAN_ARG_OFF;
+ 	else if (!strcmp(arg, "on"))
+ 		kasan_arg = KASAN_ARG_ON;
+ 	else
+ 		return -EINVAL;
++*/
++  kasan_arg = KASAN_ARG_OFF;
+ 
+ 	return 0;
+ }
+@@ -112,8 +114,10 @@ void kasan_init_hw_tags_cpu(void)
+ 	 */
+ 
+ 	/* If KASAN is disabled via command line, don't initialize it. */
+-	if (kasan_arg == KASAN_ARG_OFF)
++	if (kasan_arg == KASAN_ARG_OFF) {
++    hw_enable_tagging_sync();
+ 		return;
++  }
+ 
+ 	/*
+ 	 * Enable async mode only when explicitly requested through
+@@ -132,6 +136,7 @@ void __init kasan_init_hw_tags(void)
+ 	if (!system_supports_mte())
+ 		return;
+ 
++  kasan_arg = KASAN_ARG_OFF;
+ 	/* If KASAN is disabled via command line, don't initialize it. */
+ 	if (kasan_arg == KASAN_ARG_OFF)
+ 		return;
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index 8bf568a80..2ed6c1ac0 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -352,7 +352,7 @@ static inline void kasan_poison(const void *addr, size_t size, u8 value, bool in
+ 	if (WARN_ON(size & KASAN_GRANULE_MASK))
+ 		return;
+ 
+-	hw_set_mem_tag_range((void *)addr, size, value, init);
++	//hw_set_mem_tag_range((void *)addr, size, value, init);
+ }
+ 
+ static inline void kasan_unpoison(const void *addr, size_t size, bool init)
+@@ -380,7 +380,7 @@ static inline void kasan_unpoison(const void *addr, size_t size, bool init)
+ 	}
+ 	size = round_up(size, KASAN_GRANULE_SIZE);
+ 
+-	hw_set_mem_tag_range((void *)addr, size, tag, init);
++	//hw_set_mem_tag_range((void *)addr, size, tag, init);
+ }
+ 
+ static inline bool kasan_byte_accessible(const void *addr)
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index 1c929d964..3c276c37d 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -456,6 +456,7 @@ bool kasan_report(unsigned long addr, size_t size, bool is_write,
+ 
+ 	return ret;
+ }
++#if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
+ 
+ /*
+  * With CONFIG_KASAN, accesses to bogus pointers (outside the high
+@@ -494,3 +495,4 @@ void kasan_non_canonical_hook(unsigned long addr)
+ 	pr_alert("KASAN: %s in range [0x%016lx-0x%016lx]\n", bug_type,
+ 		 orig_addr, orig_addr + KASAN_GRANULE_SIZE - 1);
+ }
++#endif
+diff --git a/mm/memblock.c b/mm/memblock.c
+index 2f2094b16..eca52a0e8 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -1884,7 +1884,7 @@ static void __init_memblock memblock_dump(struct memblock_type *type)
+ 				 memblock_get_region_node(rgn));
+ #endif
+ 		pr_info(" %s[%#x]\t[%pa-%pa], %pa bytes%s flags: %#x\n",
+-			type->name, idx, &base, &end, &size, nid_buf, flags);
++			type->name, idx, __va(base), __va(end), &size, nid_buf, flags);
+ 	}
+ }
+ 
+diff --git a/mm/percpu.c b/mm/percpu.c
+index e0a986818..00f132f70 100644
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@ -2778,7 +2778,8 @@ void __init pcpu_setup_first_chunk(const struct pcpu_alloc_info *ai,
+ 	trace_percpu_create_chunk(base_addr);
+ 
+ 	/* we're done */
+-	pcpu_base_addr = base_addr;
++  pcpu_base_addr = base_addr;
++	//pcpu_base_addr = (void*)((uint64_t)base_addr | 0x0f00000000000000);
+ }
+ 
+ #ifdef CONFIG_SMP
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 022319e7d..a4fdafd5d 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -317,6 +317,9 @@ kmem_cache_create_usercopy(const char *name,
+ 	const char *cache_name;
+ 	int err;
+ 
++  // PeTAL
++  if (align < 16) 
++    align = 16;
+ #ifdef CONFIG_SLUB_DEBUG
+ 	/*
+ 	 * If no slub_debug was enabled globally, the static key is not yet
+diff --git a/mm/slub.c b/mm/slub.c
+index f95ae136a..50deb8014 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -37,6 +37,7 @@
+ #include <linux/memcontrol.h>
+ #include <linux/random.h>
+ #include <kunit/test.h>
++#include <asm/pointer_auth.h>
+ 
+ #include <linux/debugfs.h>
+ #include <trace/events/kmem.h>
+@@ -1756,7 +1757,9 @@ static void *setup_object(struct kmem_cache *s, struct page *page,
+ 	object = kasan_init_slab_obj(s, object);
+ 	if (unlikely(s->ctor)) {
+ 		kasan_unpoison_object_data(s, object);
+-		s->ctor(object);
++    // JH
++		s->ctor((void*)__tag_set(object, 0xf0));
++    //s->ctor(object);
+ 		kasan_poison_object_data(s, object);
+ 	}
+ 	return object;
+@@ -3218,6 +3221,8 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 
+ out:
+ 	slab_post_alloc_hook(s, objcg, gfpflags, 1, &object, init);
++  // JH
++  object = (void *)__tag_set((const void*)object, 0xf0);
+ 
+ 	return object;
+ }
+@@ -3507,11 +3512,15 @@ void ___cache_free(struct kmem_cache *cache, void *x, unsigned long addr)
+ }
+ #endif
+ 
+-void kmem_cache_free(struct kmem_cache *s, void *x)
++void kmem_cache_free(struct kmem_cache *s, void *_x)
+ {
++  void *x = __tag_reset(_x);
+ 	s = cache_from_obj(s, x);
+ 	if (!s)
+ 		return;
++  if (mte_get_mem_tag(x) & 0xf) {
++	  mte_set_mem_tag_range(x, s->object_size, 0xf0, false);
++  }
+ 	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+ 	trace_kmem_cache_free(_RET_IP_, x, s->name);
+ }
+@@ -4541,10 +4550,11 @@ size_t __ksize(const void *object)
+ }
+ EXPORT_SYMBOL(__ksize);
+ 
+-void kfree(const void *x)
++void kfree(const void *_x)
+ {
+ 	struct page *page;
+-	void *object = (void *)x;
++	void *object = __tag_reset((void *)_x);
++  const void *x = (const void*)__tag_reset((void*)_x);
+ 
+ 	trace_kfree(_RET_IP_, x);
+ 
+@@ -4556,7 +4566,12 @@ void kfree(const void *x)
+ 		free_nonslab_page(page, object);
+ 		return;
+ 	}
+-	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
++
++	// JH
++  if (mte_get_mem_tag(object) & 0xf) {
++    mte_set_mem_tag_range((void*)object, page->slab_cache->size, 0xf0, false);
++  }
++  slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+ }
+ EXPORT_SYMBOL(kfree);
+ 
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index cd434f0ec..7acaad6cb 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -40,6 +40,8 @@
+ #include <linux/hugetlb.h>
+ #include <asm/tlbflush.h>
+ #include <asm/shmparam.h>
++#include <asm/pointer_auth.h>
++#include <asm/stacktrace.h>
+ 
+ #include "internal.h"
+ #include "pgalloc-track.h"
+@@ -719,7 +721,7 @@ static DEFINE_SPINLOCK(vmap_area_lock);
+ static DEFINE_SPINLOCK(free_vmap_area_lock);
+ /* Export for kexec only */
+ LIST_HEAD(vmap_area_list);
+-static struct rb_root vmap_area_root = RB_ROOT;
++struct rb_root vmap_area_root = RB_ROOT;
+ static bool vmap_initialized __read_mostly;
+ 
+ static struct rb_root purge_vmap_area_root = RB_ROOT;
+@@ -2591,6 +2593,7 @@ static void __vunmap(const void *addr, int deallocate_pages)
+ 
+ 	if (!addr)
+ 		return;
++  addr = (const void *)__tag_reset((void*)addr);
+ 
+ 	if (WARN(!PAGE_ALIGNED(addr), "Trying to vfree() bad address (%p)\n",
+ 			addr))
+@@ -2598,7 +2601,7 @@ static void __vunmap(const void *addr, int deallocate_pages)
+ 
+ 	area = find_vm_area(addr);
+ 	if (unlikely(!area)) {
+-		WARN(1, KERN_ERR "Trying to vfree() nonexistent vm area (%p)\n",
++		WARN(1, KERN_ERR "Trying to vfree() nonexistent vm area (%llx)\n",
+ 				addr);
+ 		return;
+ 	}
+@@ -2608,6 +2611,9 @@ static void __vunmap(const void *addr, int deallocate_pages)
+ 
+ 	kasan_poison_vmalloc(area->addr, get_vm_area_size(area));
+ 
++  if (mte_get_mem_tag(area->addr) & 0xf) {
++	  mte_set_mem_tag_range((void*)area->addr, area->size, 0xf0, false);
++  }
+ 	vm_remove_mappings(area, deallocate_pages);
+ 
+ 	if (deallocate_pages) {
+@@ -2686,8 +2692,9 @@ static void __vfree(const void *addr)
+  * if we have CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG, but making the calling
+  * conventions for vfree() arch-dependent would be a really bad idea).
+  */
+-void vfree(const void *addr)
++void vfree(const void *_addr)
+ {
++  const void *addr = __tag_reset(_addr);
+ 	BUG_ON(in_nmi());
+ 
+ 	kmemleak_free(addr);
+@@ -2885,6 +2892,14 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+ 
+ 	return nr_allocated;
+ }
++static inline int is_kdfi_dump(void *addr) {
++  return 0;
++
++}
++static inline int is_kdfi_addr(void *addr) {
++  return 1;
++}
++
+ 
+ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 				 pgprot_t prot, unsigned int page_shift,
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 7090844af..d93ea672f 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1006,6 +1006,8 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ 	new->tstamp		= old->tstamp;
+ 	/* We do not copy old->sk */
+ 	new->dev		= old->dev;
++  // JH
++  //ppac_copy_all((void*)&new->dev, (void*)&old->dev, 8);
+ 	memcpy(new->cb, old->cb, sizeof(old->cb));
+ 	skb_dst_copy(new, old);
+ 	__skb_ext_copy(new, old);
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index f41e130a8..509d05a98 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -67,8 +67,10 @@
+ #include <net/sock.h>
+ #include <net/scm.h>
+ #include <net/netlink.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/netlink.h>
++#include <asm/pointer_auth.h>
+ 
+ #include "af_netlink.h"
+ 
+@@ -494,6 +496,7 @@ static inline int netlink_compare(struct rhashtable_compare_arg *arg,
+ {
+ 	const struct netlink_compare_arg *x = arg->key;
+ 	const struct netlink_sock *nlk = ptr;
++  ppac_skip((void*)x);
+ 
+ 	return nlk->portid != x->portid ||
+ 	       !net_eq(sock_net(&nlk->sk), read_pnet(&x->pnet));
+@@ -502,6 +505,7 @@ static inline int netlink_compare(struct rhashtable_compare_arg *arg,
+ static void netlink_compare_arg_init(struct netlink_compare_arg *arg,
+ 				     struct net *net, u32 portid)
+ {
++  ppac_skip(arg);
+ 	memset(arg, 0, sizeof(*arg));
+ 	write_pnet(&arg->pnet, net);
+ 	arg->portid = portid;
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 0a8a4689c..87ebc9e00 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -161,6 +161,12 @@ _c_flags += $(if $(patsubst n%,, \
+ 		$(CFLAGS_KASAN), $(CFLAGS_KASAN_NOSANITIZE))
+ endif
+ endif
++           
++ifeq ($(CONFIG_PETAL),y)
++_c_flags += $(if $(patsubst n%,, \
++		$(PETAL_SANITIZE_$(basetarget).o)$(PETAL_SANITIZE)y), \
++		-fsanitize=kdfi_instrument)
++endif
+ 
+ ifeq ($(CONFIG_UBSAN),y)
+ _c_flags += $(if $(patsubst n%,, \
+diff --git a/scripts/dtc/Makefile b/scripts/dtc/Makefile
+index 2d5f274d6..ffb88218e 100644
+--- a/scripts/dtc/Makefile
++++ b/scripts/dtc/Makefile
+@@ -38,3 +38,8 @@ HOSTCFLAGS_dtc-parser.tab.o := -I $(srctree)/$(src)
+ 
+ # dependencies on generated files need to be listed explicitly
+ $(obj)/dtc-lexer.lex.o: $(obj)/dtc-parser.tab.h
++
++# disable KDFI
++KBUILD_CFLAGS	:= $(filter-out -fsanitize=kdfi_instrument, $(KBUILD_CFLAGS))
++
++
+diff --git a/security/smack/smack_lsm.c b/security/smack/smack_lsm.c
+index 39f564f47..98dcfad2a 100644
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@ -1220,7 +1220,9 @@ static int smack_inode_getattr(const struct path *path)
+ 	int rc;
+ 
+ 	smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-	smk_ad_setfield_u_fs_path(&ad, *path);
++	//smk_ad_setfield_u_fs_path(&ad, *path);
++	memcpy(&ad.a.u.path, path, sizeof(struct path));
++
+ 	rc = smk_curacc(smk_of_inode(inode), MAY_READ, &ad);
+ 	rc = smk_bu_inode(inode, MAY_READ, rc);
+ 	return rc;
+@@ -1563,7 +1565,8 @@ static int smack_file_ioctl(struct file *file, unsigned int cmd,
+ 		return 0;
+ 
+ 	smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-	smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	//smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	memcpy(&ad.a.u.path, &file->f_path, sizeof(struct path));
+ 
+ 	if (_IOC_DIR(cmd) & _IOC_WRITE) {
+ 		rc = smk_curacc(smk_of_inode(inode), MAY_WRITE, &ad);
+@@ -1595,7 +1598,8 @@ static int smack_file_lock(struct file *file, unsigned int cmd)
+ 		return 0;
+ 
+ 	smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-	smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	//smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	memcpy(&ad.a.u.path, &file->f_path, sizeof(struct path));
+ 	rc = smk_curacc(smk_of_inode(inode), MAY_LOCK, &ad);
+ 	rc = smk_bu_file(file, MAY_LOCK, rc);
+ 	return rc;
+@@ -1629,14 +1633,16 @@ static int smack_file_fcntl(struct file *file, unsigned int cmd,
+ 	case F_SETLK:
+ 	case F_SETLKW:
+ 		smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-		smk_ad_setfield_u_fs_path(&ad, file->f_path);
++		//smk_ad_setfield_u_fs_path(&ad, file->f_path);
++		memcpy(&ad.a.u.path, &file->f_path, sizeof(struct path));
+ 		rc = smk_curacc(smk_of_inode(inode), MAY_LOCK, &ad);
+ 		rc = smk_bu_file(file, MAY_LOCK, rc);
+ 		break;
+ 	case F_SETOWN:
+ 	case F_SETSIG:
+ 		smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-		smk_ad_setfield_u_fs_path(&ad, file->f_path);
++		//smk_ad_setfield_u_fs_path(&ad, file->f_path);
++		memcpy(&ad.a.u.path, &file->f_path, sizeof(struct path));
+ 		rc = smk_curacc(smk_of_inode(inode), MAY_WRITE, &ad);
+ 		rc = smk_bu_file(file, MAY_WRITE, rc);
+ 		break;
+@@ -1836,7 +1842,8 @@ static int smack_file_receive(struct file *file)
+ 		return 0;
+ 
+ 	smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-	smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	//smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	memcpy(&ad.a.u.path, &file->f_path, sizeof(struct path));
+ 
+ 	if (inode->i_sb->s_magic == SOCKFS_MAGIC) {
+ 		sock = SOCKET_I(inode);
+@@ -1888,7 +1895,8 @@ static int smack_file_open(struct file *file)
+ 	int rc;
+ 
+ 	smk_ad_init(&ad, __func__, LSM_AUDIT_DATA_PATH);
+-	smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	//smk_ad_setfield_u_fs_path(&ad, file->f_path);
++	memcpy(&ad.a.u.path, &file->f_path, sizeof(struct path));
+ 	rc = smk_tskacc(tsp, smk_of_inode(inode), MAY_READ, &ad);
+ 	rc = smk_bu_credfile(file->f_cred, file, MAY_READ, rc);
+ 

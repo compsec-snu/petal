@@ -79,3 +79,16 @@ index 47e11a30b..9e68be59c 100644
  void petal_print(void) {
      pr_err("PETAL TEST\n");
  }
+--- a/arch/arm64/kvm/hyp/nvhe/sysreg-sr.c
++++ b/arch/arm64/kvm/hyp/nvhe/sysreg-sr.c
+@@ -17,6 +17,10 @@
+ /*
+  * Non-VHE: Both host and guest must save everything.
+  */
++int eperm;
++int eacces;
++int erofs;
++
+ noinline void *builtin_container_of(void *mptr, size_t offset) {
+         return mptr - offset;
+ }

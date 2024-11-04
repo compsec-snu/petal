@@ -174,6 +174,7 @@ void try_get_notifier_call(Instruction*, FunctionSet*);
 
 inline bool is_alloc_function(const std::string& str)
 {
+    if (str.empty()) return false;
     return alloc_funcs->exists_ignore_dot_number(str);
 }
 inline bool is_free_function(const std::string& str)
